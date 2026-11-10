@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "madout2_tools"
-version = "1.0.0"
+version = "1.0.1"
 name = "MadOut2 Tools"
 tagline = "Все Blender-инструменты MadOut2 на одной вкладке"
 maintainer = "Funtyx"

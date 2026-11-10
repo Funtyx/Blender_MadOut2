@@ -1892,6 +1892,16 @@ def _build_bridge_geometry(bm, uv_layer, settings, bm_src, mw, paths_info):
     return True, note
 
 
+def _mesh_uv_name(uv_layers):
+    """Имя UV-слоя, в который пишем бордюр: активный UV меша (UVChannel_1,
+    UVMap…). Join склеивает UV по имени — с другим именем у меша появится
+    второй UV-слой, а у бордюра в основном слое будут нули."""
+    uv = uv_layers.active
+    if uv is None and len(uv_layers):
+        uv = uv_layers[0]
+    return uv.name if uv is not None else "UVMap"
+
+
 def build_curb_preview(context):
     settings = context.scene.curb_settings
     src_obj = context.active_object
@@ -1923,7 +1933,7 @@ def build_curb_preview(context):
     _footprint = []
 
     bm = bmesh.new()
-    uv_layer = bm.loops.layers.uv.new("UVMap")
+    uv_layer = bm.loops.layers.uv.new(_mesh_uv_name(bm_src.loops.layers.uv))
 
     mw = src_obj.matrix_world
     n_mat = mw.to_3x3()
@@ -2846,6 +2856,10 @@ class CURB_OT_bake_and_merge(Operator):
             if curb_obj is None:
                 self.report({'ERROR'}, "Curb_Preview was removed")
                 return {'CANCELLED'}
+
+            # UV меша могли переименовать после превью — сверяем перед Join
+            if src_obj.data.uv_layers and curb_obj.data.uv_layers:
+                curb_obj.data.uv_layers[0].name = _mesh_uv_name(src_obj.data.uv_layers)
 
             # Join объектов (нормали уже правильные в preview)
             bpy.ops.object.select_all(action='DESELECT')
