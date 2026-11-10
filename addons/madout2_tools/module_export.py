@@ -1736,6 +1736,46 @@ def _scene_mod(target_id, guid, prop, value):
     )
 
 
+_TRANSFORM_PROPS = (
+    "m_LocalPosition.x", "m_LocalPosition.y", "m_LocalPosition.z",
+    "m_LocalRotation.x", "m_LocalRotation.y", "m_LocalRotation.z", "m_LocalRotation.w",
+    "m_LocalScale.x", "m_LocalScale.y", "m_LocalScale.z",
+)
+
+
+def _scene_transform_values(world_matrix, unit_scale):
+    """{propertyPath: значение} — world transform из Blender в осях Unity."""
+    loc, rot, scale = world_matrix.decompose()
+    vals = (_bl_pos_to_unity(loc, unit_scale) + _bl_quat_to_unity(rot)
+            + _bl_scale_to_unity(scale))
+    return {p: f"{v:.6f}" for p, v in zip(_TRANSFORM_PROPS, vals)}
+
+
+def _scene_instance_block(scene_inst_id, name, prefab_guid, inst_in_prefab, world_matrix,
+                          unit_scale):
+    tr = _variant_object_id(_FBX_TRANSFORM_ID, inst_in_prefab)
+    go = _variant_object_id(_FBX_GO_ID, inst_in_prefab)
+    vals = _scene_transform_values(world_matrix, unit_scale)
+    mods = "".join(_scene_mod(tr, prefab_guid, p, vals[p]) for p in _TRANSFORM_PROPS)
+    mods += _scene_mod(go, prefab_guid, "m_Name", _yaml_scalar(name))
+    return (
+        f"--- !u!1001 &{scene_inst_id}\n"
+        "PrefabInstance:\n"
+        "  m_ObjectHideFlags: 0\n"
+        "  serializedVersion: 2\n"
+        "  m_Modification:\n"
+        "    serializedVersion: 3\n"
+        "    m_TransformParent: {fileID: 0}\n"
+        "    m_Modifications:\n"
+        f"{mods}"
+        "    m_RemovedComponents: []\n"
+        "    m_RemovedGameObjects: []\n"
+        "    m_AddedGameObjects: []\n"
+        "    m_AddedComponents: []\n"
+        f"  m_SourcePrefab: {{fileID: 100100000, guid: {prefab_guid}, type: 3}}\n"
+    )
+
+
 def _build_unity_scene_yaml(entries, unit_scale=1.0):
     """entries: [(name, prefab_guid, prefab_instance_id, world_matrix)].
     Каждый модуль — инстанс своего .prefab, Transform = world transform из Blender
@@ -1782,42 +1822,8 @@ def _build_unity_scene_yaml(entries, unit_scale=1.0):
             scene_inst_id = _gen_file_id_base()
         used_ids.add(scene_inst_id)
         roots.append(scene_inst_id)
-
-        tr = _variant_object_id(_FBX_TRANSFORM_ID, inst_in_prefab)
-        go = _variant_object_id(_FBX_GO_ID, inst_in_prefab)
-        loc, rot, scale = world_matrix.decompose()
-        upos = _bl_pos_to_unity(loc, unit_scale)
-        uq = _bl_quat_to_unity(rot)
-        us = _bl_scale_to_unity(scale)
-        mods = "".join([
-            _scene_mod(tr, prefab_guid, "m_LocalPosition.x", f"{upos[0]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalPosition.y", f"{upos[1]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalPosition.z", f"{upos[2]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalRotation.x", f"{uq[0]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalRotation.y", f"{uq[1]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalRotation.z", f"{uq[2]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalRotation.w", f"{uq[3]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalScale.x", f"{us[0]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalScale.y", f"{us[1]:.6f}"),
-            _scene_mod(tr, prefab_guid, "m_LocalScale.z", f"{us[2]:.6f}"),
-            _scene_mod(go, prefab_guid, "m_Name", _yaml_scalar(name)),
-        ])
-        out.append(
-            f"--- !u!1001 &{scene_inst_id}\n"
-            "PrefabInstance:\n"
-            "  m_ObjectHideFlags: 0\n"
-            "  serializedVersion: 2\n"
-            "  m_Modification:\n"
-            "    serializedVersion: 3\n"
-            "    m_TransformParent: {fileID: 0}\n"
-            "    m_Modifications:\n"
-            f"{mods}"
-            "    m_RemovedComponents: []\n"
-            "    m_RemovedGameObjects: []\n"
-            "    m_AddedGameObjects: []\n"
-            "    m_AddedComponents: []\n"
-            f"  m_SourcePrefab: {{fileID: 100100000, guid: {prefab_guid}, type: 3}}\n"
-        )
+        out.append(_scene_instance_block(scene_inst_id, name, prefab_guid, inst_in_prefab,
+                                         world_matrix, unit_scale))
     out.append(
         "--- !u!1660057539 &9223372036854775807\n"
         "SceneRoots:\n"
@@ -1825,6 +1831,68 @@ def _build_unity_scene_yaml(entries, unit_scale=1.0):
         "  m_Roots:" + ("".join(f"\n  - {{fileID: {r}}}" for r in roots) if roots else " []") + "\n"
     )
     return "".join(out)
+
+
+def _set_instance_transform(block, tr_id, prefab_guid, vals):
+    """Подменяет в блоке PrefabInstance значения transform-оверрайдов;
+    недостающие оверрайды дописывает в начало m_Modifications."""
+    missing = []
+    for prop, value in vals.items():
+        pattern = (r'(- target: \{fileID: ' + str(tr_id) + r', guid: ' + prefab_guid
+                   + r', type: 3\}\n\s+propertyPath: ' + re.escape(prop) + r'\n\s+value: )[^\n]*')
+        block, n = re.subn(pattern, lambda m: m.group(1) + value, block)
+        if n == 0:
+            missing.append(prop)
+    if missing:
+        block = block.replace("    m_Modifications: []\n", "    m_Modifications:\n", 1)
+        added = "".join(_scene_mod(tr_id, prefab_guid, p, vals[p]) for p in missing)
+        block = block.replace("    m_Modifications:\n", "    m_Modifications:\n" + added, 1)
+    return block
+
+
+def _update_scene_yaml(text, entries, unit_scale=1.0):
+    """Точечное обновление существующей .unity: у инстансов выделенных домов —
+    новый transform, отсутствующие дома дописываются. Всё остальное в сцене
+    (другие объекты, правки из Unity) остаётся как было.
+    Возвращает (текст, обновлено, добавлено, пропущено[имена])."""
+    parts = re.split(r'(?=^--- !u!)', text, flags=re.M)
+    used_ids = {int(x) for x in re.findall(r'^--- !u!\d+ &(\d+)', text, re.M)}
+    updated, skipped, added_ids = 0, [], []
+    for name, prefab_guid, inst_in_prefab, world_matrix in entries:
+        tr = _variant_object_id(_FBX_TRANSFORM_ID, inst_in_prefab)
+        vals = _scene_transform_values(world_matrix, unit_scale)
+        source = f"m_SourcePrefab: {{fileID: 100100000, guid: {prefab_guid}, type: 3}}"
+        found = False
+        for i, part in enumerate(parts):
+            if not part.startswith("--- !u!1001 ") or source not in part:
+                continue
+            found = True
+            # Дом вложен в другой объект в Unity — его local ≠ world из Blender
+            if "m_TransformParent: {fileID: 0}" not in part:
+                skipped.append(name)
+                continue
+            parts[i] = _set_instance_transform(part, tr, prefab_guid, vals)
+            updated += 1
+        if not found:
+            scene_inst_id = _gen_file_id_base()
+            while scene_inst_id in used_ids:
+                scene_inst_id = _gen_file_id_base()
+            used_ids.add(scene_inst_id)
+            added_ids.append(scene_inst_id)
+            block = _scene_instance_block(scene_inst_id, name, prefab_guid, inst_in_prefab,
+                                          world_matrix, unit_scale)
+            roots_at = next((i for i, p in enumerate(parts) if "\nSceneRoots:\n" in p), len(parts))
+            parts.insert(roots_at, block)
+
+    text = "".join(parts)
+    if added_ids:
+        new_roots = "".join(f"\n  - {{fileID: {r}}}" for r in added_ids)
+        if "  m_Roots: []" in text:
+            text = text.replace("  m_Roots: []", "  m_Roots:" + new_roots, 1)
+        else:
+            text = re.sub(r'(  m_Roots:(?:\n  - \{fileID: -?\d+\})*)',
+                          lambda m: m.group(1) + new_roots, text, count=1)
+    return text, updated, len(added_ids), skipped
 
 
 def _write_scene_meta(scene_path):
@@ -1963,6 +2031,12 @@ class MODULEEXPORT_PT_main_panel(Panel):
         row.enabled = count > 0
         mode_label, mode_icon = next((m[1], m[3]) for m in _EXPORT_MODES if m[0] == mode)
         row.operator("moduleexport.export", text=f"ЭКСПОРТ · {mode_label}", icon=mode_icon)
+
+        row = layout.row()
+        row.scale_y = 1.4
+        row.enabled = count > 0
+        row.operator("moduleexport.update_scene", text="Обновить сцену · выделенные",
+                     icon='SCENE_DATA')
 
 
 class MODULEEXPORT_PT_tools(Panel):
@@ -2946,6 +3020,68 @@ class MODULEEXPORT_OT_export(Operator):
 
 
 # Регистрация свойств сцены
+class MODULEEXPORT_OT_update_scene(Operator):
+    """Обновить в сцене Unity позиции выделенных домов и добавить недостающие.
+    FBX, префабы и материалы не трогаются, остальные объекты сцены — тоже"""
+    bl_idname = "moduleexport.update_scene"
+    bl_label = "Обновить сцену"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        scene = context.scene
+        export_path = scene.module_export_path
+        if not export_path:
+            self.report({'ERROR'}, "Укажите путь экспорта!")
+            return {'CANCELLED'}
+        roots = [o for o in context.selected_objects if o.type == 'EMPTY']
+        if scene.module_export_plain_objects:
+            roots += _plain_mesh_roots(context)
+        if not roots:
+            self.report({'ERROR'}, "Выделите Empty дома")
+            return {'CANCELLED'}
+
+        prefab_dir = _resolve_prefab_dir(export_path)
+        unit_scale = float(scene.unit_settings.scale_length or 1.0)
+        entries, no_prefab = [], []
+        for obj in roots:
+            prefab_path = os.path.join(prefab_dir, obj.name + ".prefab")
+            guid = _read_existing_meta_guid(prefab_path + ".meta")
+            inst_id = _read_prefab_instance_id(prefab_path) if guid else None
+            if inst_id is None:
+                no_prefab.append(obj.name)
+                continue
+            entries.append((obj.name, guid, inst_id, obj.matrix_world.copy()))
+        if no_prefab:
+            self.report({'WARNING'}, "Нет префаба (сначала экспорт): " + ", ".join(no_prefab))
+        if not entries:
+            self.report({'ERROR'}, "Ни у одного выделенного дома нет префаба в " + prefab_dir)
+            return {'CANCELLED'}
+
+        scene_path = _resolve_scene_path(export_path)
+        try:
+            if os.path.exists(scene_path):
+                with open(scene_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                text, updated, added, skipped = _update_scene_yaml(text, entries, unit_scale)
+            else:
+                text = _build_unity_scene_yaml(entries, unit_scale)
+                updated, added, skipped = 0, len(entries), []
+            os.makedirs(os.path.dirname(scene_path), exist_ok=True)
+            with open(scene_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            _write_scene_meta(scene_path)
+        except Exception as e:
+            self.report({'ERROR'}, f"Ошибка сцены: {e}")
+            return {'CANCELLED'}
+
+        if skipped:
+            self.report({'WARNING'}, "Не тронуты (в Unity вложены в другой объект): "
+                        + ", ".join(sorted(set(skipped))))
+        self.report({'INFO'}, f"Сцена {os.path.basename(scene_path)}: обновлено {updated},"
+                              f" добавлено {added}")
+        return {'FINISHED'}
+
+
 def register_properties():
     bpy.types.Scene.module_export_path = StringProperty(
         name="Export Path",
@@ -3021,6 +3157,7 @@ classes = (
     MODULEEXPORT_OT_toggle_pivot_edit,
     MODULEEXPORT_OT_fix_materials,
     MODULEEXPORT_OT_export,
+    MODULEEXPORT_OT_update_scene,
 )
 
 
