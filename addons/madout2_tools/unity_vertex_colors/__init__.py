@@ -34,8 +34,8 @@ def load_bridge():
 BRIDGE = load_bridge()
 
 
-# Настройки живут у корневого аддона madout2_tools
-ADDON_ID = __name__.partition(".")[0]
+# Настройки живут у корневого аддона: madout2_tools или bl_ext.<репо>.madout2_tools
+ADDON_ID = __name__.rpartition(".")[0]
 
 
 def preferences(context):

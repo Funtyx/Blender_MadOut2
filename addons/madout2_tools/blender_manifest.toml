@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "madout2_tools"
+version = "1.0.0"
+name = "MadOut2 Tools"
+tagline = "Все Blender-инструменты MadOut2 на одной вкладке"
+maintainer = "Funtyx"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Экспорт FBX, PNG, материалов и префабов Unity"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "*.zip"]

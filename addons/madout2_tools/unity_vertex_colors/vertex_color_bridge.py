@@ -36,7 +36,7 @@ def enabled():
 def start(context):
     global _session, _window, _status, _folder
     stop()
-    addon = context.preferences.addons.get(__name__.partition(".")[0])
+    addon = context.preferences.addons.get(__name__.rsplit(".", 2)[0])
     configured = addon.preferences.exchange_folder if addon is not None else ""
     _folder = Path(bpy.path.abspath(configured)).expanduser() if configured else DEFAULT_FOLDER
     _folder.mkdir(parents=True, exist_ok=True)
