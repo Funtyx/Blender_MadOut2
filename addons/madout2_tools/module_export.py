@@ -234,8 +234,8 @@ _EXPORT_MODES = (
      "Только FBX. Материалы привязываются к готовым .mat (свои и соседних кварталов). "
      "Ничего нового не создаётся", 'MESH_DATA', 1),
     ('FULL', "Полный экспорт",
-     "Всё с нуля: FBX, PNG, .mat, префабы и сцена перезаписываются. "
-     "Правки этих файлов в Unity пропадут", 'PACKAGE', 2),
+     "FBX, PNG, .mat и префабы перезаписываются (правки этих файлов в Unity пропадут). "
+     "В сцене обновляются выделенные дома, остальные остаются", 'PACKAGE', 2),
     ('CUSTOM', "Вручную", "Свои галочки", 'PREFERENCES', 3),
 )
 
@@ -1966,7 +1966,7 @@ class MODULEEXPORT_PT_main_panel(Panel):
             row.prop(scene, "module_export_overwrite_prefab", text="Перезаписать .mat / PNG / префабы")
             row = col.row()
             row.enabled = cfg["scene"]
-            row.prop(scene, "module_export_overwrite_scene", text="Пересоздать сцену")
+            row.prop(scene, "module_export_overwrite_scene", text="Обновить сцену")
             box.separator(factor=0.3)
 
         col = box.column(align=True)
@@ -1978,6 +1978,8 @@ class MODULEEXPORT_PT_main_panel(Panel):
                     state, icon = "привязать к готовым", 'LINKED'
                 else:
                     state, icon = "не трогать", 'REMOVE'
+            elif cfg[over_key] and make_key == "scene":
+                state, icon = "обновить выделенные", 'CHECKMARK'
             elif cfg[over_key]:
                 state, icon = "перезаписать", 'ERROR'
             else:
@@ -2831,16 +2833,27 @@ class MODULEEXPORT_OT_export(Operator):
         if os.path.exists(scene_path) and not overwrite:
             self.report({'INFO'}, f"Сцена существует, пропуск: {scene_path}")
             return "Сцена: пропущена (уже есть)"
+        # Существующую сцену только дополняем: дома вне выделения в ней остаются
         try:
+            if os.path.exists(scene_path):
+                with open(scene_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                text, updated, added, skipped = _update_scene_yaml(text, entries, unit_scale)
+            else:
+                text = _build_unity_scene_yaml(entries, unit_scale)
+                updated, added, skipped = 0, len(entries), []
             os.makedirs(os.path.dirname(scene_path), exist_ok=True)
             with open(scene_path, 'w', encoding='utf-8') as f:
-                f.write(_build_unity_scene_yaml(entries, unit_scale))
+                f.write(text)
             _write_scene_meta(scene_path)
         except Exception as e:
             self.report({'WARNING'}, f"Ошибка сцены: {e}")
             return "Сцена: ошибка"
-        self.report({'INFO'}, f"Сцена ({len(entries)} объектов): {scene_path}")
-        return f"Сцена: {len(entries)} объектов"
+        if skipped:
+            self.report({'WARNING'}, "Не тронуты в сцене (в Unity вложены в другой объект): "
+                        + ", ".join(sorted(set(skipped))))
+        self.report({'INFO'}, f"Сцена: обновлено {updated}, добавлено {added}: {scene_path}")
+        return f"Сцена: обновлено {updated}, добавлено {added}"
 
     def execute(self, context):
         scene = context.scene
@@ -3107,9 +3120,9 @@ def register_properties():
         default=False
     )
     bpy.types.Scene.module_export_overwrite_scene = BoolProperty(
-        name="Пересоздать сцену",
-        description="ВКЛ — сцена собирается заново из текущего экспорта (правки в Unity "
-                    "пропадут). ВЫКЛ — существующая сцена не трогается",
+        name="Обновить сцену",
+        description="ВКЛ — в существующей сцене обновляются выделенные дома и добавляются "
+                    "новые, остальное не трогается. ВЫКЛ — существующая сцена не трогается",
         default=False
     )
     bpy.types.Scene.module_export_check_duplicates = BoolProperty(
