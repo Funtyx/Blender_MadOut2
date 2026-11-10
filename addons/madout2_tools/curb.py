@@ -2198,6 +2198,24 @@ def build_curb_preview(context):
 # HANDLERS - Отслеживание изменений
 # ------------------------------------------------------------------------
 
+_PREVIEW_HANDLER_NAMES = ("check_selection_change", "check_mode_change")
+
+
+def _preview_handlers():
+    """Все хендлеры, удаляющие превью, — включая копии из старого отдельного
+    аддона Clean G-Curb, если он включён вместе с MadOut2 Tools."""
+    found = []
+    for lst in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.frame_change_post):
+        for fn in list(lst):
+            if getattr(fn, "__name__", "") in _PREVIEW_HANDLER_NAMES:
+                found.append((lst, fn))
+    return found
+
+
+def _foreign_curb_modules():
+    return sorted({fn.__module__ for _, fn in _preview_handlers() if fn.__module__ != __name__})
+
+
 @persistent
 def check_selection_change(scene, depsgraph):
     """Проверяет изменения выделения и удаляет preview при необходимости"""
@@ -2830,11 +2848,11 @@ class CURB_OT_bake_and_merge(Operator):
         # Сохраняем режим для возврата
         original_mode = src_obj.mode
 
-        # ВРЕМЕННО удаляем handlers чтобы они не удалили preview
-        handlers_removed = False
-        if check_selection_change in bpy.app.handlers.depsgraph_update_post:
-            bpy.app.handlers.depsgraph_update_post.remove(check_selection_change)
-            handlers_removed = True
+        # ВРЕМЕННО снимаем ВСЕ хендлеры, удаляющие preview (и чужие копии) —
+        # иначе переход в Object Mode перед join убьёт превью
+        suspended = _preview_handlers()
+        for lst, fn in suspended:
+            lst.remove(fn)
 
         try:
             # Грани под бордюром удаляем ДО join — иначе он ляжет вторым слоем.
@@ -2904,9 +2922,9 @@ class CURB_OT_bake_and_merge(Operator):
 
         finally:
             # Восстанавливаем handlers
-            if handlers_removed:
-                if check_selection_change not in bpy.app.handlers.depsgraph_update_post:
-                    bpy.app.handlers.depsgraph_update_post.append(check_selection_change)
+            for lst, fn in suspended:
+                if fn not in lst:
+                    lst.append(fn)
 
 
 def _point_in_poly(x, y, poly):
@@ -3233,6 +3251,13 @@ class CURB_PT_panel(Panel):
 
     def draw(self, context):
         layout = self.layout
+        foreign = _foreign_curb_modules()
+        if foreign:
+            box = layout.box()
+            box.alert = True
+            box.label(text="Включён старый аддон G-Curb:", icon='ERROR')
+            box.label(text=", ".join(foreign))
+            box.label(text="Выключите его в Preferences → Add-ons")
         s = context.scene.curb_settings
 
         # ---- Пресеты ----
