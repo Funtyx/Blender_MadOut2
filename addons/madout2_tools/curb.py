@@ -2450,7 +2450,8 @@ def _analyse_curb_object(obj, faces=None, bm=None):
     if not flat_len and not wall_len:
         return None, "не удалось разобрать сечение"
 
-    data = {}
+    # грани бордюра — это всегда Г-Curb, а не заливка Bridge
+    data = {"build_mode": 'CURB'}
     if flat_len and wall_len:
         data["parts_mode"] = 'BOTH'
     elif flat_len:
