@@ -10,6 +10,14 @@
 # см. README.md в корне репозитория.
 # =====================================================
 
+import sys
+
+# При обновлении расширения Blender перезагружает только этот файл, а модули
+# инструментов остаются старыми из кэша — выкидываем их, чтобы взялся новый код
+for _name in [n for n in sys.modules if n.startswith(__name__ + ".")]:
+    del sys.modules[_name]
+    globals().pop(_name[len(__name__) + 1:], None)
+
 from . import (
     one_side_inset,
     edge_outline,
