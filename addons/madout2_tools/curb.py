@@ -2374,6 +2374,18 @@ class CURB_OT_preset_save(Operator):
         return {'FINISHED'}
 
 
+def _uv_continuous(edge, face, uv_lay, eps=1e-4):
+    """UV ребра совпадает у грани и хотя бы у одной соседней"""
+    own = {l.vert: l[uv_lay].uv for l in face.loops if l.vert in edge.verts}
+    for lo in edge.link_loops:
+        if lo.face is face:
+            continue
+        other = {l.vert: l[uv_lay].uv for l in lo.face.loops if l.vert in edge.verts}
+        if all((own[v] - other[v]).length < eps for v in edge.verts if v in own and v in other):
+            return True
+    return False
+
+
 def _analyse_curb_object(obj, faces=None, bm=None):
     """
     Разбирает бордюр по ВЫДЕЛЕННЫМ граням: ширина, высота, части, материал, UV.
@@ -2399,20 +2411,32 @@ def _analyse_curb_object(obj, faces=None, bm=None):
     along_ratio, across_span = [], []
     mat_idx = {}
     orient_sum = [0.0]
+    rib_du = rib_dv = 0.0     # куда в UV смотрят перемычки — это поперёк полосы
     for f in faces:
         n = nm @ f.normal
         if n.length_squared < 1e-12:
             continue
         n.normalize()
         horizontal = abs(n.z) >= 0.5
-        # рёбра грани: поперечные — те, что короче и не общие с соседями
+        # Поперечные рёбра («перемычки») — те, через которые UV непрерывно
+        # переходит в соседнюю плитку полосы; края полосы — шов UV или край
+        # меша. Если так не определить — берём самое короткое ребро.
         lens = []
         for e in f.edges:
             a = mw @ e.verts[0].co
             b = mw @ e.verts[1].co
             lens.append(((a - b).length, e))
-        lens.sort(key=lambda t: t[0])
-        rib = lens[0][0]
+        ribs = [d for d, e in lens if _uv_continuous(e, f, uv_lay)] if uv_lay is not None else []
+        if ribs and len(ribs) < len(lens):
+            rib = sum(ribs) / len(ribs)
+            rib_edges = {e for d, e in lens if _uv_continuous(e, f, uv_lay)}
+            for l in f.loops:
+                if l.edge in rib_edges:
+                    d = l.link_loop_next[uv_lay].uv - l[uv_lay].uv
+                    rib_du += abs(d.x); rib_dv += abs(d.y)
+        else:
+            rib = min(lens, key=lambda t: t[0])[0]
+            rib_edges = None
         if horizontal:
             flat_len.append(rib); flat_n += 1
         else:
@@ -2431,6 +2455,8 @@ def _analyse_curb_object(obj, faces=None, bm=None):
 
         if uv_lay is not None:
             for l in f.loops:
+                if rib_edges is not None and l.edge in rib_edges:
+                    continue    # масштаб UV меряем только вдоль бордюра
                 nxt = l.link_loop_next
                 d3 = ((mw @ l.vert.co) - (mw @ nxt.vert.co)).length
                 d2 = (Vector((l[uv_lay].uv.x, l[uv_lay].uv.y, 0.0)) -
@@ -2471,7 +2497,11 @@ def _analyse_curb_object(obj, faces=None, bm=None):
     if across_span and len(across_span) == 2 and uv_stats:
         u0, u1, v0, v1 = uv_stats
         # поперёк — та ось, по которой размах меньше: это полоса в атласе
-        if across_span[0] < across_span[1]:
+        if rib_du + rib_dv > 1e-9:
+            across_u = rib_du > rib_dv
+        else:
+            across_u = across_span[0] < across_span[1]
+        if across_u:
             data["uv_orientation"] = 'HORIZONTAL'
             data["uv_y_size"] = across_span[0]
             data["uv_y_offset"] = u0          # ГДЕ полоса лежит в атласе
