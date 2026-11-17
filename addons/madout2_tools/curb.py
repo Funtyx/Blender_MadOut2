@@ -3265,7 +3265,12 @@ class CURB_PT_panel(Panel):
         box.label(text="Presets:", icon='PRESET')
         row = box.row(align=True)
         row.prop(s, "active_preset", text="")
-        row.operator("curb.preset_save", text="", icon='ADD')
+        # В Edit Mode с выделенными гранями «+» снимает пресет с них
+        o = context.active_object
+        if o and o.type == 'MESH' and o.mode == 'EDIT' and o.data.total_face_sel:
+            row.operator("curb.preset_from_object", text="", icon='ADD')
+        else:
+            row.operator("curb.preset_save", text="", icon='ADD')
         row.operator("curb.preset_update", text="", icon='FILE_TICK')
         row.operator("curb.preset_rename", text="", icon='GREASEPENCIL')
         row.operator("curb.preset_delete", text="", icon='REMOVE')
