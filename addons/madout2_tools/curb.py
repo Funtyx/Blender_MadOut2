@@ -2289,10 +2289,40 @@ def restore_active_preset(dummy):
 # ОПЕРАТОРЫ — ПРЕСЕТЫ
 # ------------------------------------------------------------------------
 
+def _selected_faces_source(context):
+    """Меш в Edit Mode с выделенными гранями: сначала активный, потом
+    остальные объекты в режиме редактирования. None — граней нет."""
+    objs = [context.active_object] + list(getattr(context, "objects_in_mode", []) or [])
+    for o in objs:
+        if o is None or o.type != 'MESH' or o.mode != 'EDIT':
+            continue
+        bm = bmesh.from_edit_mesh(o.data)
+        sel = [f for f in bm.faces if f.select]
+        if sel:
+            return o, bm, sel
+    return None
+
+
+def _apply_analysis(settings, data):
+    global _SUSPEND
+    _SUSPEND += 1
+    try:
+        for k, v in data.items():
+            try:
+                setattr(settings, k, v)
+            except Exception as e:
+                print(f"[Clean G-Curb] Пропущено «{k}»: {e}")
+    finally:
+        _SUSPEND -= 1
+
+
 class CURB_OT_preset_save(Operator):
     bl_idname = "curb.preset_save"
     bl_label = "Save Preset"
-    bl_description = "Сохранить текущие настройки как пресет (профиль, части, UV, материал)"
+    bl_description = (
+        "Сохранить пресет. В Edit Mode с выделенными гранями — снять его с граней "
+        "(ширина, высота, части, материал, UV), иначе — текущие настройки"
+    )
     bl_options = {'REGISTER', 'INTERNAL'}
 
     preset_name: StringProperty(
@@ -2308,6 +2338,11 @@ class CURB_OT_preset_save(Operator):
 
     def draw(self, context):
         layout = self.layout
+        src = _selected_faces_source(context)
+        if src:
+            layout.label(text=f"Снять с граней: {len(src[2])} ({src[0].name})", icon='FACESEL')
+        else:
+            layout.label(text="Текущие настройки панели", icon='PROPERTIES')
         layout.prop(self, "preset_name")
         if self.preset_name.strip() in load_presets():
             layout.label(text="Пресет с таким именем будет перезаписан", icon='ERROR')
@@ -2319,6 +2354,13 @@ class CURB_OT_preset_save(Operator):
             return {'CANCELLED'}
 
         s = context.scene.curb_settings
+        src = _selected_faces_source(context)
+        if src:
+            data, err = _analyse_curb_object(src[0], src[2], src[1])
+            if data is None:
+                self.report({'ERROR'}, err)
+                return {'CANCELLED'}
+            _apply_analysis(s, data)
         presets = load_presets()
         presets[name] = capture_preset_values(s)
 
@@ -2481,12 +2523,12 @@ class CURB_OT_preset_from_object(Operator):
     def execute(self, context):
         obj = context.active_object
         if obj.mode == 'EDIT':
-            bm = bmesh.from_edit_mesh(obj.data)
-            sel = [f for f in bm.faces if f.select]
-            if not sel:
+            src = _selected_faces_source(context)
+            if not src:
                 self.report({'ERROR'}, "Выдели грани бордюра")
                 return {'CANCELLED'}
-            data, err = _analyse_curb_object(obj, sel, bm)
+            obj = src[0]
+            data, err = _analyse_curb_object(src[0], src[2], src[1])
         else:
             data, err = _analyse_curb_object(obj)
         if data is None:
@@ -2495,16 +2537,7 @@ class CURB_OT_preset_from_object(Operator):
 
         name = self.preset_name.strip() or obj.name
         s = context.scene.curb_settings
-        global _SUSPEND
-        _SUSPEND += 1
-        try:
-            for k, v in data.items():
-                try:
-                    setattr(s, k, v)
-                except Exception as e:
-                    print(f"[Clean G-Curb] Пропущено «{k}»: {e}")
-        finally:
-            _SUSPEND -= 1
+        _apply_analysis(s, data)
 
         presets = load_presets()
         presets[name] = capture_preset_values(s)
@@ -3265,12 +3298,8 @@ class CURB_PT_panel(Panel):
         box.label(text="Presets:", icon='PRESET')
         row = box.row(align=True)
         row.prop(s, "active_preset", text="")
-        # В Edit Mode с выделенными гранями «+» снимает пресет с них
-        o = context.active_object
-        if o and o.type == 'MESH' and o.mode == 'EDIT' and o.data.total_face_sel:
-            row.operator("curb.preset_from_object", text="", icon='ADD')
-        else:
-            row.operator("curb.preset_save", text="", icon='ADD')
+        # «+» в Edit Mode с выделенными гранями снимает пресет с них
+        row.operator("curb.preset_save", text="", icon='ADD')
         row.operator("curb.preset_update", text="", icon='FILE_TICK')
         row.operator("curb.preset_rename", text="", icon='GREASEPENCIL')
         row.operator("curb.preset_delete", text="", icon='REMOVE')
