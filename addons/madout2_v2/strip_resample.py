@@ -60,6 +60,141 @@ def _chains_from_selection(bm):
     return chains, None
 
 
+def _boundary_loop(region):
+    edges = {e for f in region for e in f.edges if sum(1 for g in e.link_faces if g in region) == 1}
+    adj = {}
+    for e in edges:
+        for v in e.verts:
+            adj.setdefault(v, []).append(e)
+    if not adj or any(len(x) != 2 for x in adj.values()):
+        return None
+    start = next(iter(adj))
+    loop = [start]
+    prev = None
+    v = start
+    while True:
+        e = next(x for x in adj[v] if x is not prev)
+        prev = e
+        v = e.other_vert(v)
+        if v is start:
+            break
+        loop.append(v)
+    return loop if len(loop) == len(adj) else None
+
+
+def _geodesic(sources, region_edges):
+    import heapq
+    dist = {v: 0.0 for v in sources}
+    heap = [(0.0, id(v), v) for v in sources]
+    heapq.heapify(heap)
+    while heap:
+        d, _, v = heapq.heappop(heap)
+        if d > dist[v]:
+            continue
+        for e in v.link_edges:
+            if e not in region_edges:
+                continue
+            w = e.other_vert(v)
+            nd = d + e.calc_length()
+            if nd < dist.get(w, _INF):
+                dist[w] = nd
+                heapq.heappush(heap, (nd, id(w), w))
+    return dist
+
+
+def _turn(loop, i):
+    a, b, c = loop[i - 1].co, loop[i].co, loop[(i + 1) % len(loop)].co
+    d0, d1 = b - a, c - b
+    return d0.angle(d1) if d0.length > 1e-9 and d1.length > 1e-9 else 0.0
+
+
+def _strip_ends(loop):
+    """Splits the outline at sharp turns; the two longest smooth pieces are the sides,
+    what lies between them (possibly stepped) are the two ends."""
+    n = len(loop)
+    breaks = [i for i in range(n) if _turn(loop, i) > math.radians(50.0)]
+    if len(breaks) < 4:
+        return None
+    pieces = []
+    for k, b in enumerate(breaks):
+        nb = breaks[(k + 1) % len(breaks)]
+        idx = [i % n for i in range(b, nb + 1 if nb > b else nb + n + 1)]
+        pieces.append(idx)
+    plen = [_arc([loop[i].co for i in p])[-1] for p in pieces]
+    m = len(pieces)
+    best = None
+    for i in range(m):
+        for j in range(i + 2, m):
+            if i == 0 and j == m - 1:
+                continue
+            total = plen[i] + plen[j]
+            if best is None or total > best[0]:
+                best = (total, i, j)
+    if best is None:
+        return None
+    _, i, j = best
+    end1 = [loop[x] for k in range(i + 1, j) for x in pieces[k]]
+    end2 = [loop[x] for k in list(range(j + 1, m)) + list(range(0, i)) for x in pieces[k]]
+    end1 = list(dict.fromkeys([loop[pieces[i][-1]]] + end1 + [loop[pieces[j][0]]]))
+    end2 = list(dict.fromkeys([loop[pieces[j][-1]]] + end2 + [loop[pieces[i][0]]]))
+    return end1, end2
+
+
+def _chains_from_region(region):
+    """Ordered lines along a selected strip of faces, from one end of the strip to the other.
+    Works with stepped ends and with triangles inside the strip."""
+    loop = _boundary_loop(region)
+    if loop is None:
+        return None, "Selected faces must form one strip without holes"
+    ends = _strip_ends(loop)
+    if ends is None:
+        return None, "Cannot find the two strip ends in the selection"
+    end_a, end_b = ends
+    region_edges = {e for f in region for e in f.edges}
+    verts = {v for f in region for v in f.verts}
+
+    # Station along the strip: 0 on one end, 1 on the other (geodesic, bends with the strip)
+    da = _geodesic(end_a, region_edges)
+    db = _geodesic(end_b, region_edges)
+    if any(v not in da or v not in db for v in verts):
+        return None, "Selected faces must be connected"
+    station = {v: da[v] / max(1e-9, da[v] + db[v]) for v in verts}
+    length = sum(da[v] + db[v] for v in verts) / len(verts)
+
+    def along(e):
+        a, b = e.verts
+        return abs(station[a] - station[b]) * length / max(1e-9, e.calc_length())
+
+    end_b_set = set(end_b)
+    chains = []
+    used = set()
+    for v in end_a:
+        chain = [v]
+        cur = v
+        for _ in range(len(verts)):
+            if cur in end_b_set and len(chain) > 1:
+                break
+            best = None
+            for e in cur.link_edges:
+                if e not in region_edges:
+                    continue
+                w = e.other_vert(cur)
+                if w in used or w in chain or station[w] <= station[cur]:
+                    continue
+                score = along(e)
+                if best is None or score > best[0]:
+                    best = (score, w)
+            if best is None:
+                return None, "Cannot trace a line along the strip"
+            cur = best[1]
+            chain.append(cur)
+        if chain[-1] not in end_b_set:
+            return None, "Cannot trace a line along the strip"
+        used |= set(chain)
+        chains.append(chain)
+    return chains, None
+
+
 def _arc(points):
     acc = [0.0]
     for a, b in zip(points, points[1:]):
@@ -235,12 +370,17 @@ class MESH_OT_strip_resample(bpy.types.Operator):
         return {'FINISHED'}
 
     def _run(self, bm, obj):
-        chains, err = _chains_from_selection(bm)
+        region = {f for f in bm.faces if f.select}
+        if region:
+            chains, err = _chains_from_region(region)
+        else:
+            chains, err = _chains_from_selection(bm)
         if err:
             raise _Fail(err)
         if not chains or len(chains) < 2:
-            raise _Fail("Select at least two lines along the strip (Alt+click or Ctrl+click path)")
-        chains = self._order_chains(chains)
+            raise _Fail("Select the strip faces, or at least two lines along it")
+        if not region:
+            chains = self._order_chains(chains)
 
         old_segments = max(len(c) - 1 for c in chains)
         pts = [[v.co.copy() for v in c] for c in chains]
@@ -294,12 +434,18 @@ class MESH_OT_strip_resample(bpy.types.Operator):
             e.select = False
         for f in bm.faces:
             f.select = False
-        for c in new_chains:
-            for v0, v1 in zip(c, c[1:]):
-                e = bm.edges.get((v0, v1))
-                if e:
-                    e.select = True
-        bm.select_flush_mode()
+        for v in bm.verts:
+            v.select = False
+        if region:
+            for f in faces:
+                f.select = True
+        else:
+            for c in new_chains:
+                for v0, v1 in zip(c, c[1:]):
+                    e = bm.edges.get((v0, v1))
+                    if e:
+                        e.select = True
+        bm.select_flush(True)
         bm.normal_update()
         return len(faces)
 
