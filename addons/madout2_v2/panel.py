@@ -10,17 +10,21 @@ import textwrap
 import bpy
 from bpy.props import BoolProperty, PointerProperty
 
-from . import big_edge_length, ground_fill, preview, strip_resample
+from . import big_edge_length, ground_fill, preview, stairs, strip_resample
 from .ui_help import draw_help
 
 SR = strip_resample.MESH_OT_strip_resample
 GF = ground_fill.MESH_OT_ground_fill
+ST = stairs.MESH_OT_stairs_from_face
+PREVIEWS = ("preview_sr", "preview_gf", "preview_st")
 
 
-def _only_one_preview(owner, other):
+def _only_one_preview(owner):
     def update(self, context):
         if getattr(self, owner):
-            setattr(self, other, False)
+            for other in PREVIEWS:
+                if other != owner and getattr(self, other):
+                    setattr(self, other, False)
     return update
 
 
@@ -33,16 +37,13 @@ def _build_settings():
     ann = {}
     ann.update({"sr_" + k: SR.__annotations__[k] for k in strip_resample.PARAM_KEYS})
     ann.update({"gf_" + k: GF.__annotations__[k] for k in ground_fill.PARAM_KEYS})
-    ann["show_sr"] = BoolProperty(name="Параметры Strip Resample", default=True)
-    ann["show_gf"] = BoolProperty(name="Параметры Ground Fill", default=True)
-    ann["help_sr"] = BoolProperty(name="Помощь", default=False)
-    ann["help_gf"] = BoolProperty(name="Помощь", default=False)
-    ann["preview_sr"] = BoolProperty(
-        name="Предпросмотр", default=False, update=_only_one_preview("preview_sr", "preview_gf"),
-        description="Показывать результат сразу, пока меняете выделение и параметры. Меш не меняется до «Применить»")
-    ann["preview_gf"] = BoolProperty(
-        name="Предпросмотр", default=False, update=_only_one_preview("preview_gf", "preview_sr"),
-        description="Показывать результат сразу, пока меняете выделение и параметры. Меш не меняется до «Применить»")
+    ann.update({"st_" + k: ST.__annotations__[k] for k in stairs.PARAM_KEYS})
+    for key, title in (("sr", "Strip Resample"), ("gf", "Ground Fill"), ("st", "Stairs")):
+        ann["show_" + key] = BoolProperty(name="Параметры " + title, default=True)
+        ann["help_" + key] = BoolProperty(name="Помощь", default=False)
+        ann["preview_" + key] = BoolProperty(
+            name="Предпросмотр", default=False, update=_only_one_preview("preview_" + key),
+            description="Показывать результат сразу, пока меняете выделение и параметры. Меш не меняется до «Применить»")
     MADOUT2V2_Settings.__annotations__ = ann
 
 
@@ -98,6 +99,8 @@ class MADOUT2V2_PT_tools(bpy.types.Panel):
               strip_resample.draw_params, strip_resample.HELP, count_text="Сегментов (0 = как сейчас)")
         _tool(col, s, "gf", "Ground Fill", GF, ground_fill.PARAM_KEYS,
               ground_fill.draw_params, ground_fill.HELP)
+        _tool(col, s, "st", "Stairs", ST, stairs.PARAM_KEYS,
+              stairs.draw_params, stairs.HELP)
 
 
 class MADOUT2V2_PT_edge_length(bpy.types.Panel):

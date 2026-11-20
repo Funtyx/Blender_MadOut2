@@ -10,7 +10,7 @@ import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
 
-from . import ground_fill, strip_resample
+from . import ground_fill, stairs, strip_resample
 
 from mathutils import Vector
 
@@ -24,6 +24,7 @@ _handle = None
 _TOOLS = {
     'SR': (strip_resample.StripResampleCore, strip_resample.PARAM_KEYS, "sr_", strip_resample._Fail),
     'GF': (ground_fill.GroundFillCore, ground_fill.PARAM_KEYS, "gf_", ground_fill._Fail),
+    'ST': (stairs.StairsCore, stairs.PARAM_KEYS, "st_", stairs._Fail),
 }
 
 
@@ -32,6 +33,8 @@ def active_tool(s):
         return 'SR'
     if s.preview_gf:
         return 'GF'
+    if s.preview_st:
+        return 'ST'
     return None
 
 
@@ -93,6 +96,8 @@ def _compute(obj, tool, s):
         info = f"Будет {len(faces)} граней"
         if tool == 'GF':
             return [], _surface(faces, mw, s.gf_shade_smooth), "", info
+        if tool == 'ST':
+            return [], _surface(faces, mw, False), "", stairs.describe(core.summary)
         edges = {e for f in faces for e in f.edges}
         lines = []
         for e in edges:
