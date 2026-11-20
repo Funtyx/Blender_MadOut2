@@ -59,11 +59,13 @@ def _tool(layout, s, key, title, op_cls, keys, draw_params, help_lines, count_te
     box = layout.box()
     is_open = getattr(s, "show_" + key)
     box.prop(s, "show_" + key, text=title, icon='TRIA_DOWN' if is_open else 'TRIA_RIGHT', emboss=False)
-    if is_open:
-        if count_text:
-            draw_params(box, s, key + "_", count_text)
-        else:
-            draw_params(box, s, key + "_")
+    if not is_open:
+        # Свёрнутая секция прячет всё: параметры, предпросмотр, «Применить» и помощь
+        return
+    if count_text:
+        draw_params(box, s, key + "_", count_text)
+    else:
+        draw_params(box, s, key + "_")
 
     row = box.row(align=True)
     row.scale_y = 1.3
@@ -78,9 +80,7 @@ def _tool(layout, s, key, title, op_cls, keys, draw_params, help_lines, count_te
             _wrapped(box, error, 'ERROR')
         elif info:
             _wrapped(box, info, 'INFO')
-    if is_open:
-        # Помощь живёт внутри секции инструмента и сворачивается вместе с ней
-        draw_help(box, s, "help_" + key, help_lines)
+    draw_help(box, s, "help_" + key, help_lines)
 
 
 class MADOUT2V2_PT_tools(bpy.types.Panel):

@@ -26,7 +26,13 @@ HELP = (
     "  крутой — высокие узкие.",
     "«Высота ступени» / «Количество» — задать вручную.",
     "Шаг 2h+b — длина шага человека (600–660 мм).",
-    "Боковины — закрыть треугольники по бокам.",
+    "Можно выделить и ровные площадки: лестница",
+    "  будет только на наклонных гранях (Мин. уклон).",
+    "Стенки «Ровные» — верх на уровне верхней",
+    "  площадки, «По углу» — вдоль носов ступеней;",
+    "  Толщина — наружу, Подъём — выше ступеней.",
+    "Боковины — закрыть треугольники по бокам",
+    "  (со стенками не нужны).",
     "Врезать в скат — ступени ниже линии ската.",
     "UV «По ступеням» — каждая ступень одна плитка",
     "  (подступёнок + проступь), «Развёртка» — сплошная",
@@ -92,16 +98,36 @@ class StairsCore:
     def _run(self, bm, obj):
         mw = obj.matrix_world
         inv = mw.inverted()
+        nmat = inv.transposed().to_3x3()
         faces_in = [f for f in bm.faces if f.select]
         if not faces_in:
-            raise _Fail("Выделите грань-скат")
-        shared = {e for f in faces_in for e in f.edges if sum(1 for g in e.link_faces if g in faces_in) > 1}
-        if shared:
-            raise _Fail("Выделенные грани соседние — делайте лестницу по одной грани")
+            raise _Fail("Выделите грань-скат (можно вместе с ровными площадками)")
+
+        # Flat faces are landings and stay as they are; only sloped ones become stairs
+        ramps = []
+        for f in faces_in:
+            n = (nmat @ f.normal).normalized()
+            slope = math.degrees(math.acos(min(1.0, abs(n.z))))
+            if slope < math.degrees(self.min_slope):
+                continue
+            if len(f.verts) != 4:
+                raise _Fail("Наклонная грань должна быть четырёхугольной")
+            ramps.append(f)
+        if not ramps:
+            raise _Fail("Нет наклонных граней: лестница строится на скате, ровные площадки остаются как есть")
+
+        side_edges = {}
+        for f in ramps:
+            (b0, b1), (t0, t1) = _ramp(f, mw)
+            for v0, v1 in ((b0, t0), (b1, t1)):
+                e = bm.edges.get((v0, v1))
+                if e in side_edges:
+                    raise _Fail("Два ската касаются боками — делайте их по одному")
+                side_edges[e] = f
 
         self.summary = []
         result = []
-        for face in faces_in:
+        for face in ramps:
             result += self._one(bm, face, mw, inv)
         bm.normal_update()
         return result
@@ -174,13 +200,81 @@ class StairsCore:
         for k in range(n):
             pieces.append(('RISER', k, add([lc[k], rc[k], rn[k], ln[k]], down_slope)))
             pieces.append(('TREAD', k, add([ln[k], rn[k], rc[k + 1], lc[k + 1]], up_dir)))
-            if self.sides:
+            # With walls the wall's inner face is welded to the step profile instead
+            if self.sides and self.walls == 'NONE':
                 add([lc[k], ln[k], lc[k + 1]], -across)
                 add([rc[k], rn[k], rc[k + 1]], across)
 
         if uv_layer is not None:
             self._uv(uv_layer, pieces, built, lc, rc, ln, rn, sides, riser, tread, mw)
-        return [f for f, _ in built]
+        faces = [f for f, _ in built]
+        if self.walls != 'NONE':
+            top_z = max(sides[0][2].z, sides[1][2].z, (sides[0][2] + sides[0][3]).z, (sides[1][2] + sides[1][3]).z)
+            for chain, nose, side, out in ((lc, ln, sides[0], -across), (rc, rn, sides[1], across)):
+                faces += self._wall(bm, chain, nose, side, out, n, top_z, height < 0, material, uv_layer, mw, inv)
+        return faces
+
+    def _wall(self, bm, chain, nose, side, outward, n, top_z, cut, material, uv_layer, mw, inv):
+        """Side wall with thickness: inner face welded to the step profile, flat or sloped top."""
+        _, _, wb, d = side
+        rise = d.z / n
+        raise_by = max(self.wall_raise, 0.005)
+        th = self.wall_thickness
+        fwd = Vector((d.x, d.y, 0.0)).normalized()
+        ramp = [wb + d * (k / n) for k in range(n + 1)]
+        if self.walls == 'FLAT':
+            tops = [Vector((p.x, p.y, top_z + raise_by)) for p in ramp]
+        else:
+            lift = max(rise, 0.0)
+            tops = [p + Vector((0.0, 0.0, lift + raise_by)) for p in ramp]
+        new = lambda co: bm.verts.new(inv @ co)
+        top = [new(p) for p in tops]
+        top_out = [new(p + outward * th) for p in tops]
+        bottom_out = [new(p + outward * th) for p in ramp]
+
+        made = []
+
+        def add(verts, want):
+            verts = list(dict.fromkeys(verts))
+            if len(verts) < 3:
+                return
+            f = bm.faces.get(verts) or bm.faces.new(verts)
+            f.normal_update()
+            if (mw.to_3x3() @ f.normal).dot(want) < 0:
+                f.normal_flip()
+            f.material_index = material
+            f.smooth = False
+            made.append(f)
+
+        inward = -outward
+        up = Vector((0.0, 0.0, 1.0))
+        for k in range(n):
+            if cut:
+                inner = [nose[k], chain[k + 1], top[k + 1], top[k], chain[k]]
+            else:
+                inner = [nose[k], chain[k + 1]] + ([nose[k + 1]] if k + 1 < n else []) + [top[k + 1], top[k]]
+            add(inner, inward)
+            add([bottom_out[k], bottom_out[k + 1], top_out[k + 1], top_out[k]], outward)
+            add([top[k], top[k + 1], top_out[k + 1], top_out[k]], up)
+        # Cut-in: the first riser hangs below the ramp line, so the wall end starts at the line itself
+        start = ([chain[0]] if cut else [chain[0], nose[0]]) + [top[0], top_out[0], bottom_out[0]]
+        add(start, -fwd)
+        add([chain[n], top[n], top_out[n], bottom_out[n]], fwd)
+
+        if uv_layer is not None:
+            sc = self.uv_scale
+            for f in made:
+                n_w = (mw.to_3x3() @ f.normal).normalized()
+                for l in f.loops:
+                    p = mw @ l.vert.co - wb
+                    if abs(n_w.z) > 0.7:
+                        uv = (p.dot(fwd), p.dot(outward))
+                    elif abs(n_w.dot(fwd)) > 0.7:
+                        uv = (p.dot(outward), p.z)
+                    else:
+                        uv = (p.dot(fwd), p.z)
+                    l[uv_layer].uv = (uv[0] * sc, uv[1] * sc)
+        return made
 
     def _uv(self, layer, pieces, built, lc, rc, ln, rn, sides, riser, tread, mw):
         sc = self.uv_scale
@@ -235,6 +329,20 @@ class MESH_OT_stairs_from_face(StairsCore, bpy.types.Operator):
         name="Высота ступени", default=0.16, min=0.02, soft_max=0.4, unit='LENGTH',
         description="Желаемая высота ступени; число ступеней подбирается так, чтобы ровно уложиться в высоту ската")
     count: IntProperty(name="Ступеней", default=10, min=1, max=500, description="Число ступеней")
+    walls: EnumProperty(
+        name="Стенки", default='NONE',
+        items=[
+            ('NONE', "Нет", "Без боковых стенок"),
+            ('FLAT', "Ровные", "Верх стенки горизонтальный — на уровне верхней площадки плюс подъём"),
+            ('SLOPE', "По углу", "Верх стенки идёт параллельно носам ступеней плюс подъём"),
+        ])
+    wall_thickness: FloatProperty(name="Толщина стенки", default=0.25, min=0.01, soft_max=2.0, unit='LENGTH',
+                                  description="Толщина боковой стенки наружу от лестницы")
+    wall_raise: FloatProperty(name="Подъём стенки", default=0.1, min=0.0, soft_max=2.0, unit='LENGTH',
+                              description="Насколько стенка выше ступеней (у ровной — выше верхней площадки)")
+    min_slope: FloatProperty(name="Мин. уклон", default=math.radians(3.0), min=0.0, max=math.radians(80.0),
+                             subtype='ANGLE',
+                             description="Грани положе этого угла — площадки: они остаются как есть")
     sides: BoolProperty(name="Боковины", default=True,
                         description="Закрыть треугольники между ступенями и линией ската по бокам")
     flip_direction: BoolProperty(name="Врезать в скат", default=False,
@@ -285,7 +393,8 @@ def describe(summary):
     return text
 
 
-PARAM_KEYS = ("mode", "step_rule", "riser", "count", "sides", "flip_direction", "uv_mode", "uv_scale")
+PARAM_KEYS = ("mode", "step_rule", "riser", "count", "sides", "flip_direction", "walls", "wall_thickness",
+              "wall_raise", "min_slope", "uv_mode", "uv_scale")
 
 
 def draw_params(layout, data, prefix):
@@ -301,6 +410,14 @@ def draw_params(layout, data, prefix):
     row = col.row(align=True)
     row.prop(data, prefix + "sides")
     row.prop(data, prefix + "flip_direction")
+    col.prop(data, prefix + "min_slope")
+    col.label(text="Стенки:")
+    col.row().prop(data, prefix + "walls", expand=True)
+    if getattr(data, prefix + "walls") != 'NONE':
+        row = col.row(align=True)
+        row.prop(data, prefix + "wall_thickness", text="Толщина")
+        row.prop(data, prefix + "wall_raise", text="Подъём")
+    col.label(text="UV:")
     col.row().prop(data, prefix + "uv_mode", expand=True)
     col.prop(data, prefix + "uv_scale")
 
