@@ -286,6 +286,9 @@ class GroundFillCore:
         bm.normal_update()
         self._orient(faces, a + b)
         self._assign_material(faces, a + b)
+        if self.shade_smooth:
+            for f in faces:
+                f.smooth = True
         if self.uv_strip:
             self._write_uv(bm, faces, uv_of, width, length, closed)
         return faces
@@ -430,6 +433,8 @@ class MESH_OT_ground_fill(GroundFillCore, bpy.types.Operator):
     uv_strip: BoolProperty(
         name="UV полосой", default=True,
         description="Записать UV в активный слой: U поперёк, V вдоль")
+    shade_smooth: BoolProperty(name="Shade Smooth", default=True,
+                               description="Сразу сделать новые грани сглаженными (Shade Smooth)")
     uv_scale: FloatProperty(name="UV на метр", default=0.1, min=0.0001, soft_max=10.0,
                             description="Сколько единиц UV приходится на метр")
     show_help: BoolProperty(name="Помощь", default=False)
@@ -461,7 +466,7 @@ class MESH_OT_ground_fill(GroundFillCore, bpy.types.Operator):
 
 
 PARAM_KEYS = ("rows", "segments", "slope_mode", "relax", "bulge", "shape", "bias", "end_taper",
-              "flip", "uv_strip", "uv_scale")
+              "flip", "shade_smooth", "uv_strip", "uv_scale")
 
 
 def draw_params(layout, data, prefix):
@@ -477,7 +482,9 @@ def draw_params(layout, data, prefix):
     col.prop(data, prefix + "bias")
     col.prop(data, prefix + "end_taper")
     col.separator()
-    col.prop(data, prefix + "flip")
+    row = col.row(align=True)
+    row.prop(data, prefix + "shade_smooth")
+    row.prop(data, prefix + "flip")
     col.prop(data, prefix + "uv_strip")
     sub = col.column()
     sub.enabled = getattr(data, prefix + "uv_strip")

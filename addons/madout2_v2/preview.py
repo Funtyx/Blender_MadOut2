@@ -12,9 +12,13 @@ from gpu_extras.batch import batch_for_shader
 
 from . import ground_fill, strip_resample
 
-PREVIEW_COLOR = (0.15, 1.0, 0.55, 0.95)
+from mathutils import Vector
 
-_state = {"key": None, "lines": [], "batch": None, "error": "", "info": ""}
+PREVIEW_COLOR = (0.15, 1.0, 0.55, 0.95)
+SURFACE_COLOR = Vector((0.62, 0.66, 0.6))
+LIGHT = Vector((0.35, -0.45, 0.82)).normalized()
+
+_state = {"key": None, "lines": [], "batch": None, "tris": None, "tri_batch": None, "error": "", "info": ""}
 _handle = None
 
 _TOOLS = {
@@ -55,23 +59,50 @@ def _signature(obj):
     return obj.name, len(bm.verts), len(bm.edges), len(bm.faces), count, round(acc, 5)
 
 
+def _surface(faces, mw, smooth):
+    """Shaded triangles of the new faces: positions and per-vertex colours lit by a fixed light."""
+    new = set(faces)
+    nmat = mw.inverted().transposed().to_3x3()
+    pos, col = [], []
+    for f in faces:
+        loops = list(f.loops)
+        for j in range(1, len(loops) - 1):
+            for l in (loops[0], loops[j], loops[j + 1]):
+                n = l.vert.normal if smooth else f.normal
+                if smooth:
+                    # Only the new faces count, so the chain vertices are not bent by the old geometry
+                    acc = sum((g.normal for g in l.vert.link_faces if g in new), Vector())
+                    n = acc if acc.length > 1e-9 else n
+                n = (nmat @ n).normalized()
+                light = 0.38 + 0.62 * max(0.0, n.dot(LIGHT)) + 0.12 * max(0.0, -n.dot(LIGHT))
+                c = SURFACE_COLOR * light
+                pos.append(tuple(mw @ l.vert.co))
+                col.append((c.x, c.y, c.z, 1.0))
+    return pos, col
+
+
 def _compute(obj, tool, s):
+    """Returns (lines, triangles, error, info)."""
     core, _ = _core(tool, s)
     fail = _TOOLS[tool][3]
     bm = bmesh.from_edit_mesh(obj.data).copy()
     mw = obj.matrix_world
     try:
         faces = core._run(bm, obj)
+        bm.normal_update()
+        info = f"Будет {len(faces)} граней"
+        if tool == 'GF':
+            return [], _surface(faces, mw, s.gf_shade_smooth), "", info
         edges = {e for f in faces for e in f.edges}
         lines = []
         for e in edges:
             lines.append(tuple(mw @ e.verts[0].co))
             lines.append(tuple(mw @ e.verts[1].co))
-        return lines, "", f"Будет {len(faces)} граней"
+        return lines, None, "", info
     except fail as ex:
-        return [], str(ex), ""
+        return [], None, str(ex), ""
     except Exception as ex:
-        return [], f"Ошибка предпросмотра: {ex}", ""
+        return [], None, f"Ошибка предпросмотра: {ex}", ""
     finally:
         bm.free()
 
@@ -86,8 +117,8 @@ def _redraw():
                 area.tag_redraw()
 
 
-def _set(lines, error, info):
-    _state.update(lines=lines, batch=None, error=error, info=info)
+def _set(lines, tris, error, info):
+    _state.update(lines=lines, batch=None, tris=tris, tri_batch=None, error=error, info=info)
     _redraw()
 
 
@@ -100,7 +131,7 @@ def _timer():
         if tool is None or obj is None or obj.type != 'MESH':
             if _state["key"] is not None:
                 _state["key"] = None
-                _set([], "", "")
+                _set([], None, "", "")
             return 0.25
         _, params = _core(tool, s)
         key = (tool, params, _signature(obj), tuple(obj.matrix_world.col[3]))
@@ -113,6 +144,19 @@ def _timer():
 
 
 def _draw():
+    tris = _state["tris"]
+    if tris and tris[0]:
+        shader = gpu.shader.from_builtin('SMOOTH_COLOR')
+        if _state["tri_batch"] is None:
+            _state["tri_batch"] = batch_for_shader(shader, 'TRIS', {"pos": tris[0], "color": tris[1]})
+        gpu.state.depth_test_set('LESS_EQUAL')
+        gpu.state.depth_mask_set(True)
+        gpu.state.face_culling_set('NONE')
+        shader.bind()
+        _state["tri_batch"].draw(shader)
+        gpu.state.depth_mask_set(False)
+        gpu.state.depth_test_set('NONE')
+
     lines = _state["lines"]
     if not lines:
         return
@@ -144,4 +188,4 @@ def unregister():
     if _handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_handle, 'WINDOW')
         _handle = None
-    _state.update(key=None, lines=[], batch=None, error="", info="")
+    _state.update(key=None, lines=[], batch=None, tris=None, tri_batch=None, error="", info="")
