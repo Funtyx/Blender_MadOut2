@@ -30,7 +30,9 @@ HELP = (
     "  будет только на наклонных гранях (Мин. уклон).",
     "Стенки «Ровные» — верх на уровне верхней",
     "  площадки, «По углу» — вдоль носов ступеней;",
-    "  Толщина — наружу, Подъём — выше ступеней.",
+    "  Толщина «Наружу» — ступени той же ширины,",
+    "  «Внутрь» — стенка внутри ската, ступени уже.",
+    "  Подъём — насколько стенка выше ступеней.",
     "Боковины — закрыть треугольники по бокам",
     "  (со стенками не нужны).",
     "Врезать в скат — ступени ниже линии ската.",
@@ -153,23 +155,19 @@ class StairsCore:
         side_edges = [bm.edges.get((b, t)) for b, t, _, _ in sides]
         bmesh.ops.delete(bm, geom=[face], context='FACES_ONLY')
 
-        # Inner corners lie on the ramp line (side edges are split there, so neighbours stay welded);
-        # step noses stand one riser above them.
-        corners, noses = [], []
-        for (b, t, wb, d), e in zip(sides, side_edges):
-            chain = [b]
-            cur = b
-            for k in range(1, n):
-                edge = bm.edges.get((cur, t)) if e is not None else None
-                if edge is None:
-                    nv = bm.verts.new(b.co)
-                else:
-                    _, nv = bmesh.utils.edge_split(edge, cur, 1.0 / (n - k + 1))
-                nv.co = inv @ (wb + d * (k / n))
-                chain.append(nv)
-                cur = nv
-            chain.append(t)
-            corners.append(chain)
+        # Points on the ramp sides (side edges are split there, so neighbours stay welded)
+        side_chains = [self._split_line(bm, b, t, wb, d, n, e, inv) for (b, t, wb, d), e in zip(sides, side_edges)]
+
+        walls_inside = self.walls != 'NONE' and self.wall_side == 'IN'
+        if walls_inside:
+            # Walls take their thickness from the stair width: steps start at the wall's inner face
+            sides, corners = self._inner_sides(bm, sides, side_chains, n, mw, inv)
+        else:
+            corners = side_chains
+
+        # Inner corners lie on the ramp line, step noses stand one riser above them
+        noses = []
+        for (b, t, wb, d) in sides:
             up = Vector((0.0, 0.0, d.z / n))
             noses.append([bm.verts.new(inv @ (wb + d * (k / n) + up)) for k in range(n)])
 
@@ -210,16 +208,66 @@ class StairsCore:
         faces = [f for f, _ in built]
         if self.walls != 'NONE':
             top_z = max(sides[0][2].z, sides[1][2].z, (sides[0][2] + sides[0][3]).z, (sides[1][2] + sides[1][3]).z)
-            for chain, nose, side, out in ((lc, ln, sides[0], -across), (rc, rn, sides[1], across)):
-                faces += self._wall(bm, chain, nose, side, out, n, top_z, height < 0, material, uv_layer, mw, inv)
+            for i, (chain, nose, out) in enumerate(((lc, ln, -across), (rc, rn, across))):
+                wb, d = sides[i][2], sides[i][3]
+                if walls_inside:
+                    outer_pts = [mw @ v.co for v in side_chains[i]]
+                    outer_verts = side_chains[i]
+                else:
+                    outer_pts = [wb + d * (k / n) + out * self.wall_thickness for k in range(n + 1)]
+                    outer_verts = None
+                faces += self._wall(bm, chain, nose, sides[i], out, outer_pts, outer_verts, n, top_z,
+                                    height < 0, material, uv_layer, mw, inv)
         return faces
 
-    def _wall(self, bm, chain, nose, side, outward, n, top_z, cut, material, uv_layer, mw, inv):
-        """Side wall with thickness: inner face welded to the step profile, flat or sloped top."""
+    @staticmethod
+    def _split_line(bm, b, t, wb, d, n, edge, inv):
+        chain = [b]
+        cur = b
+        for k in range(1, n):
+            e = bm.edges.get((cur, t)) if edge is not None else None
+            if e is None:
+                nv = bm.verts.new(b.co)
+            else:
+                _, nv = bmesh.utils.edge_split(e, cur, 1.0 / (n - k + 1))
+            nv.co = inv @ (wb + d * (k / n))
+            chain.append(nv)
+            cur = nv
+        chain.append(t)
+        return chain
+
+    def _inner_sides(self, bm, sides, side_chains, n, mw, inv):
+        th = self.wall_thickness
+        (b0, t0, _, _), (b1, t1, _, _) = sides
+        ends = []
+        for v0, v1 in ((b0, b1), (t0, t1)):
+            w0, w1 = mw @ v0.co, mw @ v1.co
+            width = (w1 - w0).length
+            if 2 * th >= width - 0.05:
+                raise _Fail("Стенки внутрь толще, чем ширина лестницы")
+            e = bm.edges.get((v0, v1))
+            _, p0 = bmesh.utils.edge_split(e, v0, th / width)
+            p0.co = inv @ (w0 + (w1 - w0).normalized() * th)
+            e = bm.edges.get((p0, v1))
+            _, p1 = bmesh.utils.edge_split(e, v1, th / (width - th))
+            p1.co = inv @ (w1 + (w0 - w1).normalized() * th)
+            ends.append((p0, p1))
+        (bi0, bi1), (ti0, ti1) = ends
+        new_sides, corners = [], []
+        for bi, ti in ((bi0, ti0), (bi1, ti1)):
+            wb, wt = mw @ bi.co, mw @ ti.co
+            d = wt - wb
+            new_sides.append((bi, ti, wb, d))
+            corners.append([bi] + [bm.verts.new(inv @ (wb + d * (k / n))) for k in range(1, n)] + [ti])
+        return new_sides, corners
+
+    def _wall(self, bm, chain, nose, side, outward, outer_pts, outer_verts, n, top_z, cut, material, uv_layer,
+              mw, inv):
+        """Side wall with thickness: inner face welded to the step profile, flat or sloped top.
+        outer_pts — the wall's outer bottom line; outer_verts — existing vertices there (walls inside)."""
         _, _, wb, d = side
         rise = d.z / n
         raise_by = max(self.wall_raise, 0.005)
-        th = self.wall_thickness
         fwd = Vector((d.x, d.y, 0.0)).normalized()
         ramp = [wb + d * (k / n) for k in range(n + 1)]
         if self.walls == 'FLAT':
@@ -229,8 +277,8 @@ class StairsCore:
             tops = [p + Vector((0.0, 0.0, lift + raise_by)) for p in ramp]
         new = lambda co: bm.verts.new(inv @ co)
         top = [new(p) for p in tops]
-        top_out = [new(p + outward * th) for p in tops]
-        bottom_out = [new(p + outward * th) for p in ramp]
+        top_out = [new(Vector((o.x, o.y, p.z))) for o, p in zip(outer_pts, tops)]
+        bottom_out = outer_verts if outer_verts is not None else [new(o) for o in outer_pts]
 
         made = []
 
@@ -338,6 +386,12 @@ class MESH_OT_stairs_from_face(StairsCore, bpy.types.Operator):
         ])
     wall_thickness: FloatProperty(name="Толщина стенки", default=0.25, min=0.01, soft_max=2.0, unit='LENGTH',
                                   description="Толщина боковой стенки наружу от лестницы")
+    wall_side: EnumProperty(
+        name="Толщина", default='OUT',
+        items=[
+            ('OUT', "Наружу", "Стенка снаружи лестницы: ширина ступеней не меняется"),
+            ('IN', "Внутрь", "Стенка внутри ширины ската: наружная сторона по краю ската, ступени уже"),
+        ])
     wall_raise: FloatProperty(name="Подъём стенки", default=0.1, min=0.0, soft_max=2.0, unit='LENGTH',
                               description="Насколько стенка выше ступеней (у ровной — выше верхней площадки)")
     min_slope: FloatProperty(name="Мин. уклон", default=math.radians(3.0), min=0.0, max=math.radians(80.0),
@@ -394,7 +448,7 @@ def describe(summary):
 
 
 PARAM_KEYS = ("mode", "step_rule", "riser", "count", "sides", "flip_direction", "walls", "wall_thickness",
-              "wall_raise", "min_slope", "uv_mode", "uv_scale")
+              "wall_side", "wall_raise", "min_slope", "uv_mode", "uv_scale")
 
 
 def draw_params(layout, data, prefix):
@@ -414,6 +468,7 @@ def draw_params(layout, data, prefix):
     col.label(text="Стенки:")
     col.row().prop(data, prefix + "walls", expand=True)
     if getattr(data, prefix + "walls") != 'NONE':
+        col.row().prop(data, prefix + "wall_side", expand=True)
         row = col.row(align=True)
         row.prop(data, prefix + "wall_thickness", text="Толщина")
         row.prop(data, prefix + "wall_raise", text="Подъём")
