@@ -23,6 +23,7 @@ from . import (
     strip_resample,
     big_edge_length,
     panel,
+    preview,
 )
 
 TOOLS = (
@@ -30,6 +31,7 @@ TOOLS = (
     strip_resample,
     big_edge_length,
     panel,
+    preview,
 )
 
 

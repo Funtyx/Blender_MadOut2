@@ -1,20 +1,27 @@
 # =====================================================
 # Вкладка «MadOut2 V2» в боковой панели 3D View (N):
-# кнопки инструментов с параметрами и настройки Big Edge Length.
+# у каждого инструмента параметры, «Предпросмотр» и «Применить».
 # Параметры хранятся в сцене и передаются инструменту при нажатии;
-# после запуска их можно докрутить в F9.
+# после применения их можно докрутить в F9.
 # =====================================================
+
+import textwrap
 
 import bpy
 from bpy.props import BoolProperty, PointerProperty
 
-from . import big_edge_length, ground_fill, strip_resample
+from . import big_edge_length, ground_fill, preview, strip_resample
 from .ui_help import draw_help
 
 SR = strip_resample.MESH_OT_strip_resample
 GF = ground_fill.MESH_OT_ground_fill
-SR_KEYS = ("mode", "count", "spacing", "smooth", "keep_corners", "corner_angle")
-GF_KEYS = ("rows", "extra_along", "merge_along", "bulge", "shape", "bias", "end_taper", "flip", "uv_strip", "uv_scale")
+
+
+def _only_one_preview(owner, other):
+    def update(self, context):
+        if getattr(self, owner):
+            setattr(self, other, False)
+    return update
 
 
 class MADOUT2V2_Settings(bpy.types.PropertyGroup):
@@ -24,22 +31,53 @@ class MADOUT2V2_Settings(bpy.types.PropertyGroup):
 def _build_settings():
     # Параметры панели — те же определения, что у операторов, чтобы не расходились
     ann = {}
-    ann.update({"sr_" + k: SR.__annotations__[k] for k in SR_KEYS})
-    ann.update({"gf_" + k: GF.__annotations__[k] for k in GF_KEYS})
+    ann.update({"sr_" + k: SR.__annotations__[k] for k in strip_resample.PARAM_KEYS})
+    ann.update({"gf_" + k: GF.__annotations__[k] for k in ground_fill.PARAM_KEYS})
     ann["show_sr"] = BoolProperty(name="Параметры Strip Resample", default=True)
-    ann["show_gf"] = BoolProperty(name="Параметры Ground Fill", default=False)
+    ann["show_gf"] = BoolProperty(name="Параметры Ground Fill", default=True)
     ann["help_sr"] = BoolProperty(name="Помощь", default=False)
     ann["help_gf"] = BoolProperty(name="Помощь", default=False)
+    ann["preview_sr"] = BoolProperty(
+        name="Предпросмотр", default=False, update=_only_one_preview("preview_sr", "preview_gf"),
+        description="Показывать результат сразу, пока меняете выделение и параметры. Меш не меняется до «Применить»")
+    ann["preview_gf"] = BoolProperty(
+        name="Предпросмотр", default=False, update=_only_one_preview("preview_gf", "preview_sr"),
+        description="Показывать результат сразу, пока меняете выделение и параметры. Меш не меняется до «Применить»")
     MADOUT2V2_Settings.__annotations__ = ann
 
 
-def _tool_box(layout, s, show_prop, op_cls, icon):
+def _wrapped(layout, text, icon):
+    lines = textwrap.wrap(text, 42) or [""]
+    col = layout.column(align=True)
+    col.scale_y = 0.8
+    for i, line in enumerate(lines):
+        col.label(text=line, icon=icon if i == 0 else 'BLANK1')
+
+
+def _tool(layout, s, key, title, op_cls, keys, draw_params, help_lines, count_text=None):
     box = layout.box()
+    is_open = getattr(s, "show_" + key)
+    box.prop(s, "show_" + key, text=title, icon='TRIA_DOWN' if is_open else 'TRIA_RIGHT', emboss=False)
+    if is_open:
+        if count_text:
+            draw_params(box, s, key + "_", count_text)
+        else:
+            draw_params(box, s, key + "_")
+
     row = box.row(align=True)
-    is_open = getattr(s, show_prop)
-    row.prop(s, show_prop, text="", icon='TRIA_DOWN' if is_open else 'TRIA_RIGHT', emboss=False)
-    op = row.operator(op_cls.bl_idname, icon=icon)
-    return box, op, is_open
+    row.scale_y = 1.3
+    row.prop(s, "preview_" + key, toggle=True, icon='HIDE_OFF')
+    op = row.operator(op_cls.bl_idname, text="Применить", icon='CHECKMARK')
+    for k in keys:
+        setattr(op, k, getattr(s, key + "_" + k))
+
+    if getattr(s, "preview_" + key):
+        info, error = preview.status()
+        if error:
+            _wrapped(box, error, 'ERROR')
+        elif info:
+            _wrapped(box, info, 'INFO')
+    draw_help(box, s, "help_" + key, help_lines)
 
 
 class MADOUT2V2_PT_tools(bpy.types.Panel):
@@ -52,48 +90,14 @@ class MADOUT2V2_PT_tools(bpy.types.Panel):
     def draw(self, context):
         s = context.scene.madout2_v2
         layout = self.layout
-        layout.enabled = context.mode == 'EDIT_MESH'
         if context.mode != 'EDIT_MESH':
-            layout.label(text="Только в Edit Mode", icon='INFO')
-
-        box, op, is_open = _tool_box(layout, s, "show_sr", SR, 'CENTER_ONLY')
-        for k in SR_KEYS:
-            setattr(op, k, getattr(s, "sr_" + k))
-        if is_open:
-            col = box.column()
-            col.row().prop(s, "sr_mode", expand=True)
-            if s.sr_mode == 'COUNT':
-                col.prop(s, "sr_count", text="Сегментов (0 = как сейчас)")
-            else:
-                col.prop(s, "sr_spacing")
-            col.prop(s, "sr_smooth")
-            row = col.row(align=True)
-            row.prop(s, "sr_keep_corners")
-            sub = row.row()
-            sub.active = s.sr_keep_corners
-            sub.prop(s, "sr_corner_angle", text="")
-            draw_help(box, s, "help_sr", strip_resample.HELP)
-
-        box, op, is_open = _tool_box(layout, s, "show_gf", GF, 'MOD_DISPLACE')
-        for k in GF_KEYS:
-            setattr(op, k, getattr(s, "gf_" + k))
-        if is_open:
-            col = box.column()
-            col.prop(s, "gf_rows")
-            col.prop(s, "gf_extra_along")
-            col.prop(s, "gf_merge_along")
-            col.separator()
-            col.prop(s, "gf_bulge")
-            col.prop(s, "gf_shape")
-            col.prop(s, "gf_bias")
-            col.prop(s, "gf_end_taper")
-            col.separator()
-            col.prop(s, "gf_flip")
-            col.prop(s, "gf_uv_strip")
-            sub = col.column()
-            sub.enabled = s.gf_uv_strip
-            sub.prop(s, "gf_uv_scale")
-            draw_help(box, s, "help_gf", ground_fill.HELP)
+            layout.label(text="Работает в Edit Mode", icon='INFO')
+        col = layout.column()
+        col.enabled = context.mode == 'EDIT_MESH'
+        _tool(col, s, "sr", "Strip Resample", SR, strip_resample.PARAM_KEYS,
+              strip_resample.draw_params, strip_resample.HELP, count_text="Сегментов (0 = как сейчас)")
+        _tool(col, s, "gf", "Ground Fill", GF, ground_fill.PARAM_KEYS,
+              ground_fill.draw_params, ground_fill.HELP)
 
 
 class MADOUT2V2_PT_edge_length(bpy.types.Panel):

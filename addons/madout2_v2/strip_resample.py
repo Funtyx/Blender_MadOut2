@@ -338,63 +338,8 @@ def _match(params, anchored, targets):
     return assign, removed
 
 
-class MESH_OT_strip_resample(bpy.types.Operator):
-    """Равномерно перераспределить поперечные рёбра полосы по плавной кривой (больше или меньше граней)"""
-    bl_idname = "mesh.strip_resample"
-    bl_label = "Strip Resample"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    mode: EnumProperty(
-        name="Режим", default='COUNT',
-        items=[
-            ('COUNT', "Количество", "Задать, сколько сегментов будет вдоль полосы"),
-            ('SPACING', "Шаг", "Задать расстояние между поперечными рёбрами"),
-        ])
-    count: IntProperty(
-        name="Сегментов", default=0, min=0, max=10000, options={'SKIP_SAVE'},
-        description="Сколько сегментов вдоль полосы. Больше — граней больше, меньше — граней меньше. "
-                    "При запуске подставляется текущее количество")
-    spacing: FloatProperty(
-        name="Шаг", default=2.0, min=0.01, soft_max=50.0, unit='LENGTH',
-        description="Расстояние между поперечными рёбрами вдоль полосы. Меньше шаг — граней больше")
-    smooth: FloatProperty(
-        name="Плавность", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
-        description="0 — точки идут по старым прямым рёбрам, 1 — по плавной кривой через вершины (дуга остаётся дугой)")
-    keep_corners: BoolProperty(
-        name="Сохранять углы", default=True,
-        description="Острые изломы линии не скругляются: на каждый угол встаёт поперечное ребро")
-    corner_angle: FloatProperty(
-        name="Угол", default=math.radians(35.0), min=math.radians(1.0), max=math.radians(179.0),
-        subtype='ANGLE', description="Излом круче этого угла считается острым углом")
-    show_help: BoolProperty(name="Помощь", default=False)
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == 'EDIT_MESH' and context.edit_object is not None
-
-    def draw(self, context):
-        col = self.layout.column()
-        col.row().prop(self, "mode", expand=True)
-        col.prop(self, "count" if self.mode == 'COUNT' else "spacing")
-        col.prop(self, "smooth")
-        row = col.row(align=True)
-        row.prop(self, "keep_corners")
-        sub = row.row()
-        sub.active = self.keep_corners
-        sub.prop(self, "corner_angle", text="")
-        draw_help(self.layout, self, "show_help", HELP)
-
-    def execute(self, context):
-        obj = context.edit_object
-        bm = bmesh.from_edit_mesh(obj.data)
-        try:
-            n_faces = self._run(bm, obj)
-        except _Fail as ex:
-            self.report({'ERROR'}, str(ex))
-            return {'CANCELLED'}
-        bmesh.update_edit_mesh(obj.data)
-        self.report({'INFO'}, f"Strip Resample: {n_faces} граней")
-        return {'FINISHED'}
+class StripResampleCore:
+    """Algorithm shared by the operator and the live preview; parameters are read from self."""
 
     def _run(self, bm, obj):
         region = {f for f in bm.faces if f.select}
@@ -477,7 +422,7 @@ class MESH_OT_strip_resample(bpy.types.Operator):
                         e.select = True
         bm.select_flush(True)
         bm.normal_update()
-        return len(faces)
+        return faces
 
     @staticmethod
     def _order_chains(chains):
@@ -599,6 +544,75 @@ class MESH_OT_strip_resample(bpy.types.Operator):
                 l[lay].uv = data[0][0][li] * w.x + data[1][0][li] * w.y + data[2][0][li] * w.z
             for li, lay in enumerate(s["col_layers"]):
                 l[lay] = data[0][1][li] * w.x + data[1][1][li] * w.y + data[2][1][li] * w.z
+
+
+class MESH_OT_strip_resample(StripResampleCore, bpy.types.Operator):
+    """Равномерно перераспределить поперечные рёбра полосы по плавной кривой (больше или меньше граней)"""
+    bl_idname = "mesh.strip_resample"
+    bl_label = "Strip Resample"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: EnumProperty(
+        name="Режим", default='COUNT',
+        items=[
+            ('COUNT', "Количество", "Задать, сколько сегментов будет вдоль полосы"),
+            ('SPACING', "Шаг", "Задать расстояние между поперечными рёбрами"),
+        ])
+    count: IntProperty(
+        name="Сегментов", default=0, min=0, max=10000, options={'SKIP_SAVE'},
+        description="Сколько сегментов вдоль полосы. Больше — граней больше, меньше — граней меньше. "
+                    "При запуске подставляется текущее количество")
+    spacing: FloatProperty(
+        name="Шаг", default=2.0, min=0.01, soft_max=50.0, unit='LENGTH',
+        description="Расстояние между поперечными рёбрами вдоль полосы. Меньше шаг — граней больше")
+    smooth: FloatProperty(
+        name="Плавность", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+        description="0 — точки идут по старым прямым рёбрам, 1 — по плавной кривой через вершины (дуга остаётся дугой)")
+    keep_corners: BoolProperty(
+        name="Сохранять углы", default=True,
+        description="Острые изломы линии не скругляются: на каждый угол встаёт поперечное ребро")
+    corner_angle: FloatProperty(
+        name="Угол", default=math.radians(35.0), min=math.radians(1.0), max=math.radians(179.0),
+        subtype='ANGLE', description="Излом круче этого угла считается острым углом")
+    show_help: BoolProperty(name="Помощь", default=False)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH' and context.edit_object is not None
+
+    def draw(self, context):
+        draw_params(self.layout, self, "")
+        draw_help(self.layout, self, "show_help", HELP)
+
+    def execute(self, context):
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        try:
+            n_faces = len(self._run(bm, obj))
+        except _Fail as ex:
+            self.report({'ERROR'}, str(ex))
+            return {'CANCELLED'}
+        bmesh.update_edit_mesh(obj.data)
+        self.report({'INFO'}, f"Strip Resample: {n_faces} граней")
+        return {'FINISHED'}
+
+
+PARAM_KEYS = ("mode", "count", "spacing", "smooth", "keep_corners", "corner_angle")
+
+
+def draw_params(layout, data, prefix, count_text=None):
+    col = layout.column()
+    col.row().prop(data, prefix + "mode", expand=True)
+    if getattr(data, prefix + "mode") == 'COUNT':
+        col.prop(data, prefix + "count", text=count_text) if count_text else col.prop(data, prefix + "count")
+    else:
+        col.prop(data, prefix + "spacing")
+    col.prop(data, prefix + "smooth")
+    row = col.row(align=True)
+    row.prop(data, prefix + "keep_corners")
+    sub = row.row()
+    sub.active = getattr(data, prefix + "keep_corners")
+    sub.prop(data, prefix + "corner_angle", text="")
 
 
 class _Fail(Exception):

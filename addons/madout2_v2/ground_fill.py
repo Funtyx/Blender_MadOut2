@@ -13,22 +13,25 @@ from mathutils import Vector
 
 from .ui_help import draw_help
 
+_INF = float("inf")
+
 HELP = (
-    "Что делает: заливает сетку граней между двумя",
-    "цепочками рёбер и вваривает её в них.",
+    "Что делает: заливает «умный» рельеф между двумя",
+    "цепочками рёбер и вваривает его в них.",
+    "Внутри — ровная сетка, у краёв — переходный ряд,",
+    "поэтому густые вершины не собирают линии в пучок.",
     "",
     "Что выделить: две цепочки рёбер (обе открытые",
     "или обе замкнутые — тогда получится кольцо).",
     "",
-    "Рядов — линии между цепочками: больше — гуще.",
-    "Доп. поперёк — ещё линии поперёк по длине.",
+    "Рядов / Сегментов — плотность сетки поперёк и",
+    "  вдоль (0 сегментов = ячейки почти квадратные).",
+    "Склон «Рельеф» — поверхность продолжает уклон",
+    "  соседних граней, без излома на стыке.",
+    "Выравнивание — сглаживает сетку на изгибах.",
     "Подъём — холм (+) или яма (−) в метрах.",
-    "Профиль — форма склона, Сдвиг вершины —",
-    "  холм ближе к одной из цепочек.",
-    "Затухание у концов — подъём сходит на нет",
-    "  у открытых концов.",
-    "Материал и сглаживание — от соседней грани.",
-    "Откат — Ctrl+Z.",
+    "Предпросмотр в панели N: видно сразу,",
+    "  меш меняется только по «Применить».",
 )
 
 
@@ -127,8 +130,263 @@ def _bias_t(t, bias):
     return 0.5 * t / peak if t <= peak else 0.5 + 0.5 * (t - peak) / (1.0 - peak)
 
 
-class MESH_OT_ground_fill(bpy.types.Operator):
-    """Залить сетку между двумя выделенными цепочками рёбер, с рядами и подъёмом/прогибом"""
+
+
+def _eval(points, params, s, closed):
+    pts = list(points) + ([points[0]] if closed else [])
+    for i in range(len(params) - 1):
+        if params[i] <= s <= params[i + 1] or i == len(params) - 2:
+            span = params[i + 1] - params[i]
+            f = 0.0 if span <= 0 else (s - params[i]) / span
+            return pts[i].lerp(pts[i + 1], min(1.0, max(0.0, f))), i
+    return pts[0].copy(), 0
+
+
+def _hermite(z0, z1, m0, m1, t):
+    t2, t3 = t * t, t * t * t
+    return (2 * t3 - 3 * t2 + 1) * z0 + (t3 - 2 * t2 + t) * m0 + (-2 * t3 + 3 * t2) * z1 + (t3 - t2) * m1
+
+
+def _ladder(xs, px, ys, py):
+    """Faces bridging two vertex rows with different spacing: quads where they line up, triangles elsewhere."""
+    faces = []
+    i = j = 0
+    while i < len(xs) - 1 or j < len(ys) - 1:
+        if i == len(xs) - 1:
+            faces.append((xs[i], ys[j + 1], ys[j]))
+            j += 1
+            continue
+        if j == len(ys) - 1:
+            faces.append((xs[i], xs[i + 1], ys[j]))
+            i += 1
+            continue
+        nx, ny = px[i + 1], py[j + 1]
+        step = min(px[i + 1] - px[i], py[j + 1] - py[j])
+        if abs(nx - ny) < 0.35 * step:
+            faces.append((xs[i], xs[i + 1], ys[j + 1], ys[j]))
+            i += 1
+            j += 1
+        elif nx < ny:
+            faces.append((xs[i], xs[i + 1], ys[j]))
+            i += 1
+        else:
+            faces.append((xs[i], ys[j + 1], ys[j]))
+            j += 1
+    return faces
+
+
+class _Fail(Exception):
+    pass
+
+
+class GroundFillCore:
+    """Algorithm shared by the operator and the live preview; parameters are read from self."""
+
+    def _run(self, bm, obj):
+        mw = obj.matrix_world
+        inv = mw.inverted()
+        nmat = inv.transposed().to_3x3()
+
+        chains, err = _chains_from_selection(bm)
+        if err:
+            raise _Fail(err)
+        if chains is None or len(chains) != 2:
+            raise _Fail("Выделите ровно две отдельные цепочки рёбер")
+        (a, a_closed), (b, b_closed) = chains
+        if a_closed != b_closed:
+            raise _Fail("Обе цепочки должны быть открытыми или обе замкнутыми")
+        closed = a_closed
+        if len(a) < 2 or len(b) < 2:
+            raise _Fail("В каждой цепочке нужно хотя бы одно ребро")
+        b = _align_chains(a, b, closed, mw)
+
+        wa = [mw @ v.co for v in a]
+        wb = [mw @ v.co for v in b]
+        pa, len_a = _arc_params(wa, closed)
+        pb, len_b = _arc_params(wb, closed)
+        length = 0.5 * (len_a + len_b)
+        probe = [k / 16 for k in range(17)]
+        width = sum((_eval(wa, pa, s, closed)[0] - _eval(wb, pb, s, closed)[0]).length for s in probe) / len(probe)
+
+        rows = self.rows
+        segs = self.segments
+        if segs <= 0:
+            cell = max(1e-6, width / (rows + 1))
+            segs = max(1, round(length / cell))
+        if closed:
+            segs = max(3, segs)
+        cols = [k / segs for k in range(segs + (0 if closed else 1))]
+
+        normals_a = self._side_normals(bm, a, closed, nmat)
+        normals_b = self._side_normals(bm, b, closed, nmat)
+
+        # Columns: points on both chains, cross slopes from the neighbouring faces
+        col_a, col_b, slope_a, slope_b = [], [], [], []
+        for s in cols:
+            pa_pt, ia = _eval(wa, pa, s, closed)
+            pb_pt, ib = _eval(wb, pb, s, closed)
+            col_a.append(pa_pt)
+            col_b.append(pb_pt)
+            d = pb_pt - pa_pt
+            secant = d.z
+            slope_a.append(self._slope(normals_a[ia], d, secant))
+            slope_b.append(self._slope(normals_b[ib], d, secant))
+
+        # Interior grid positions (XY), then relax so lines stay even on bends
+        ts = [r / (rows + 1) for r in range(1, rows + 1)]
+        grid = [[col_a[k].lerp(col_b[k], t) for k in range(len(cols))] for t in ts]
+        self._relax(grid, col_a, col_b, closed)
+
+        taper_len = self.end_taper
+        new_grid = []
+        for r, t in enumerate(ts):
+            row = []
+            tb = _bias_t(t, self.bias)
+            for k, s in enumerate(cols):
+                co = grid[r][k]
+                z = _hermite(col_a[k].z, col_b[k].z, slope_a[k], slope_b[k], t)
+                taper = 1.0
+                if not closed and taper_len > 0:
+                    edge_dist = min(s, 1.0 - s) / taper_len
+                    taper = 0.5 - 0.5 * math.cos(math.pi * min(1.0, edge_dist))
+                z += self.bulge * _profile(tb, self.shape) * taper
+                row.append(bm.verts.new(inv @ Vector((co.x, co.y, z))))
+            new_grid.append(row)
+
+        uv_of = {}
+        for i, v in enumerate(a):
+            uv_of[v] = (0.0, pa[i])
+        for i, v in enumerate(b):
+            uv_of[v] = (1.0, pb[i])
+        for r, row in enumerate(new_grid):
+            for k, v in enumerate(row):
+                uv_of[v] = (ts[r], cols[k])
+
+        quads = []
+        wrap = (lambda lst: lst + [lst[0]]) if closed else (lambda lst: lst)
+        col_params = cols + ([1.0] if closed else [])
+        a_list, a_par = wrap(list(a)), pa
+        b_list, b_par = wrap(list(b)), pb
+        if rows == 0:
+            quads += _ladder(a_list, a_par, b_list, b_par)
+        else:
+            quads += _ladder(a_list, a_par, wrap(new_grid[0]), col_params)
+            for r in range(rows - 1):
+                lo, hi = wrap(new_grid[r]), wrap(new_grid[r + 1])
+                for k in range(len(lo) - 1):
+                    quads.append((lo[k], lo[k + 1], hi[k + 1], hi[k]))
+            quads += _ladder(wrap(new_grid[-1]), col_params, b_list, b_par)
+
+        faces = []
+        for q in quads:
+            q = list(dict.fromkeys(q))
+            if len(q) < 3 or bm.faces.get(q):
+                continue
+            faces.append(bm.faces.new(q))
+        bm.normal_update()
+        self._orient(faces, a + b)
+        self._assign_material(faces, a + b)
+        if self.uv_strip:
+            self._write_uv(bm, faces, uv_of, width, length, closed)
+        return faces
+
+    @staticmethod
+    def _side_normals(bm, chain, closed, nmat):
+        pts = chain + ([chain[0]] if closed else [])
+        normals = []
+        for v0, v1 in zip(pts, pts[1:]):
+            e = bm.edges.get((v0, v1))
+            n = Vector()
+            if e:
+                for f in e.link_faces:
+                    n += nmat @ f.normal
+            normals.append(n.normalized() if n.length > 1e-9 else None)
+        return normals
+
+    def _slope(self, n, d, secant):
+        if self.slope_mode == 'LINEAR':
+            return secant
+        if self.slope_mode == 'EASE':
+            return 0.0
+        # Rise of the neighbouring surface continued across the fill (z per whole cross distance)
+        horiz = Vector((d.x, d.y, 0.0))
+        if n is None or abs(n.z) < 0.2 or horiz.length < 1e-9:
+            return secant
+        h = horiz.normalized()
+        rise = -(n.x * h.x + n.y * h.y) / n.z * horiz.length
+        limit = max(abs(secant) * 3.0, horiz.length * 0.5)
+        return max(-limit, min(limit, rise))
+
+    def _relax(self, grid, col_a, col_b, closed):
+        rows = len(grid)
+        if rows == 0:
+            return
+        n = len(grid[0])
+        for _ in range(self.relax):
+            new = [[p.copy() for p in row] for row in grid]
+            for r in range(rows):
+                for k in range(n):
+                    if not closed and (k == 0 or k == n - 1):
+                        continue
+                    left = grid[r][(k - 1) % n]
+                    right = grid[r][(k + 1) % n]
+                    down = col_a[k] if r == 0 else grid[r - 1][k]
+                    up = col_b[k] if r == rows - 1 else grid[r + 1][k]
+                    avg = (left + right + down + up) * 0.25
+                    new[r][k] = grid[r][k].lerp(avg, 0.5)
+            grid[:] = new
+
+    def _orient(self, faces, chain_verts):
+        new = set(faces)
+        flip_all = None
+        for v in chain_verts:
+            for e in v.link_edges:
+                olds = [f for f in e.link_faces if f not in new]
+                news = [f for f in e.link_faces if f in new]
+                if olds and news:
+                    def start(f):
+                        for l in f.loops:
+                            if l.edge is e:
+                                return l.vert
+                    flip_all = start(olds[0]) is start(news[0])
+                    break
+            if flip_all is not None:
+                break
+        if flip_all is None:
+            flip_all = sum((f.normal for f in faces), Vector()).z < 0
+        if flip_all != self.flip:
+            for f in faces:
+                f.normal_flip()
+
+    @staticmethod
+    def _assign_material(faces, chain_verts):
+        new = set(faces)
+        src = None
+        for v in chain_verts:
+            src = next((f for f in v.link_faces if f not in new), None)
+            if src:
+                break
+        if src:
+            for f in faces:
+                f.material_index = src.material_index
+                f.smooth = src.smooth
+
+    def _write_uv(self, bm, faces, uv_of, width, length, closed):
+        layer = bm.loops.layers.uv.active
+        if layer is None:
+            return
+        for f in faces:
+            vs = [uv_of[v][1] for v in f.verts if v in uv_of]
+            wrap = closed and vs and max(vs) - min(vs) > 0.5
+            for l in f.loops:
+                t, s = uv_of.get(l.vert, (0.0, 0.0))
+                if wrap and s < 0.5:
+                    s += 1.0
+                l[layer].uv = (t * width * self.uv_scale, s * length * self.uv_scale)
+
+
+class MESH_OT_ground_fill(GroundFillCore, bpy.types.Operator):
+    """Залить «умный» рельеф между двумя выделенными цепочками рёбер"""
     bl_idname = "mesh.ground_fill"
     bl_label = "Ground Fill"
     bl_options = {'REGISTER', 'UNDO'}
@@ -136,12 +394,19 @@ class MESH_OT_ground_fill(bpy.types.Operator):
     rows: IntProperty(
         name="Рядов", default=3, min=0, max=200,
         description="Сколько линий провести между цепочками (параллельно им). Больше — граней больше")
-    extra_along: IntProperty(
-        name="Доп. поперёк", default=0, min=0, max=500,
-        description="Добавить поперечные линии, равномерно по длине. Больше — граней больше")
-    merge_along: FloatProperty(
-        name="Слияние", default=0.02, min=0.0, max=0.2, subtype='FACTOR',
-        description="Поперечные линии ближе этой доли длины сливаются, чтобы не было тонких граней")
+    segments: IntProperty(
+        name="Сегментов", default=0, min=0, max=2000,
+        description="Сколько сегментов вдоль. 0 — подобрать так, чтобы ячейки были почти квадратными")
+    slope_mode: EnumProperty(
+        name="Склон", default='SMART',
+        items=[
+            ('SMART', "Рельеф", "Поверхность продолжает уклон соседних граней — без излома на стыке"),
+            ('EASE', "Плавный", "Плавно выходит горизонтально от обоих краёв"),
+            ('LINEAR', "Прямой", "Прямой уклон от края до края"),
+        ])
+    relax: IntProperty(
+        name="Выравнивание", default=4, min=0, max=50,
+        description="Сколько раз сгладить сетку: линии на изгибах становятся ровнее")
     bulge: FloatProperty(
         name="Подъём", default=0.0, soft_min=-20.0, soft_max=20.0, unit='LENGTH',
         description="Поднять землю вверх (+) или прогнуть вниз (−), метры по мировой Z")
@@ -174,244 +439,49 @@ class MESH_OT_ground_fill(bpy.types.Operator):
         return context.mode == 'EDIT_MESH' and context.edit_object is not None
 
     def draw(self, context):
-        col = self.layout.column()
-        col.prop(self, "rows")
-        col.prop(self, "extra_along")
-        col.prop(self, "merge_along")
-        col.separator()
-        col.prop(self, "bulge")
-        col.prop(self, "shape")
-        col.prop(self, "bias")
-        col.prop(self, "end_taper")
-        col.separator()
-        col.prop(self, "flip")
-        col.prop(self, "uv_strip")
-        sub = col.column()
-        sub.enabled = self.uv_strip
-        sub.prop(self, "uv_scale")
+        draw_params(self.layout, self, "")
         draw_help(self.layout, self, "show_help", HELP)
 
     def execute(self, context):
         obj = context.edit_object
-        me = obj.data
-        mw = obj.matrix_world
-        bm = bmesh.from_edit_mesh(me)
-
-        chains, err = _chains_from_selection(bm)
-        if err:
-            self.report({'ERROR'}, err)
+        bm = bmesh.from_edit_mesh(obj.data)
+        try:
+            faces = self._run(bm, obj)
+        except _Fail as ex:
+            self.report({'ERROR'}, str(ex))
             return {'CANCELLED'}
-        if chains is None or len(chains) != 2:
-            self.report({'ERROR'}, "Выделите ровно две отдельные цепочки рёбер")
-            return {'CANCELLED'}
-        (a, a_closed), (b, b_closed) = chains
-        if a_closed != b_closed:
-            self.report({'ERROR'}, "Обе цепочки должны быть открытыми или обе замкнутыми")
-            return {'CANCELLED'}
-        closed = a_closed
-        if len(a) < 2 or len(b) < 2:
-            self.report({'ERROR'}, "В каждой цепочке нужно хотя бы одно ребро")
-            return {'CANCELLED'}
-        b = _align_chains(a, b, closed, mw)
-
-        a, b = self._match_along(bm, a, b, closed, mw)
-        if a is None:
-            self.report({'ERROR'}, "Не удалось сопоставить цепочки")
-            return {'CANCELLED'}
-
-        grid, faces = self._build_grid(bm, obj, a, b, closed)
-        self._orient(bm, faces, a + b)
-        self._assign_material(faces, a + b)
-        if self.uv_strip:
-            self._faces = faces
-            self._write_uv(bm, grid, closed, mw)
-
         for f in bm.faces:
             f.select = False
         for f in faces:
             f.select = True
         bm.select_flush_mode()
-        bmesh.update_edit_mesh(me)
+        bmesh.update_edit_mesh(obj.data)
         self.report({'INFO'}, f"Ground Fill: {len(faces)} граней")
         return {'FINISHED'}
 
-    def _match_along(self, bm, a, b, closed, mw):
-        pa, len_a = _arc_params([mw @ v.co for v in a], closed)
-        pb, len_b = _arc_params([mw @ v.co for v in b], closed)
-        last = len(pa) - (1 if closed else 0)
 
-        items = [(p, 'A', i) for i, p in enumerate(pa[:len(a)])]
-        items += [(p, 'B', i) for i, p in enumerate(pb[:len(b)])]
-        n = self.extra_along + 1
-        items += [(k / n, None, None) for k in range(1, n)]
-        if not closed:
-            items += [(1.0, None, None)]
-        items.sort(key=lambda x: (x[0], x[1] is None))
+PARAM_KEYS = ("rows", "segments", "slope_mode", "relax", "bulge", "shape", "bias", "end_taper",
+              "flip", "uv_strip", "uv_scale")
 
-        clusters = []
-        for p, side, idx in items:
-            cur = clusters[-1] if clusters else None
-            if cur and p - cur["p0"] <= self.merge_along and (side is None or side not in cur):
-                if side:
-                    cur[side] = idx
-                continue
-            if cur and side is None and p - cur["p0"] <= self.merge_along:
-                continue
-            c = {"p0": p}
-            if side:
-                c[side] = idx
-            clusters.append(c)
-        if not closed:
-            # Chain ends are always matched to each other.
-            ends = {"A": len(a) - 1, "B": len(b) - 1}
-            for side, last_idx in ends.items():
-                for c in clusters[:-1]:
-                    if c.get(side) == last_idx:
-                        del c[side]
-                clusters[-1][side] = last_idx
-            clusters[0]["A"], clusters[0]["B"] = 0, 0
-        for c in clusters:
-            c["p"] = c["p0"]
 
-        new_a = self._split_chain(bm, a, pa, [(c["p"], c.get("A")) for c in clusters], closed)
-        new_b = self._split_chain(bm, b, pb, [(c["p"], c.get("B")) for c in clusters], closed)
-        return new_a, new_b
-
-    def _split_chain(self, bm, chain, params, targets, closed):
-        """For each (param, existing_index or None), sorted by param, returns a vertex, splitting chain edges where needed."""
-        verts = chain + ([chain[0]] if closed else [])
-        result = []
-        seg = 0
-        start, start_p = verts[0], params[0]
-        for p, idx in targets:
-            if idx is not None:
-                seg = idx
-                start, start_p = chain[idx], params[idx]
-                result.append(start)
-                continue
-            new_seg = seg
-            while new_seg < len(verts) - 2 and p >= params[new_seg + 1]:
-                new_seg += 1
-            if new_seg != seg:
-                seg = new_seg
-                start, start_p = verts[seg], params[seg]
-            end_p = params[seg + 1]
-            edge = bm.edges.get((start, verts[seg + 1]))
-            if edge is None:
-                return None
-            fac = (p - start_p) / max(1e-12, end_p - start_p)
-            _, nv = bmesh.utils.edge_split(edge, start, min(max(fac, 1e-4), 1 - 1e-4))
-            result.append(nv)
-            start, start_p = nv, p
-        return result
-
-    def _build_grid(self, bm, obj, a, b, closed):
-        mw = obj.matrix_world
-        inv3 = mw.inverted().to_3x3()
-        up_local = inv3 @ Vector((0.0, 0.0, 1.0))
-        rows = self.rows + 1
-        k_count = len(a)
-        wa = [mw @ v.co for v in a]
-        _, total = _arc_params(wa, closed)
-        along, _ = _arc_params(wa, closed)
-
-        grid = [a]
-        for r in range(1, rows):
-            t = r / rows
-            h = self.bulge * _profile(_bias_t(t, self.bias), self.shape)
-            row = []
-            for k in range(k_count):
-                taper = 1.0
-                if not closed and self.end_taper > 0:
-                    s = along[k]
-                    edge_dist = min(s, 1.0 - s) / self.end_taper
-                    taper = 0.5 - 0.5 * math.cos(math.pi * min(1.0, edge_dist))
-                co = a[k].co.lerp(b[k].co, t) + up_local * (h * taper)
-                row.append(bm.verts.new(co))
-            grid.append(row)
-        grid.append(b)
-
-        faces = []
-        k_last = k_count if closed else k_count - 1
-        for r in range(rows):
-            for k in range(k_last):
-                k2 = (k + 1) % k_count
-                quad = [grid[r][k], grid[r][k2], grid[r + 1][k2], grid[r + 1][k]]
-                if len(set(quad)) < 3:
-                    continue
-                quad = list(dict.fromkeys(quad))
-                if bm.faces.get(quad):
-                    continue
-                faces.append(bm.faces.new(quad))
-        bm.normal_update()
-        return grid, faces
-
-    def _orient(self, bm, faces, a):
-        new = set(faces)
-        flip_all = None
-        for v in a:
-            for e in v.link_edges:
-                olds = [f for f in e.link_faces if f not in new]
-                news = [f for f in e.link_faces if f in new]
-                if olds and news:
-                    def winding(f):
-                        for l in f.loops:
-                            if l.edge is e:
-                                return l.vert
-                    flip_all = winding(olds[0]) is winding(news[0])
-                    break
-            if flip_all is not None:
-                break
-        if flip_all is None:
-            avg = sum((f.normal for f in faces), Vector())
-            flip_all = avg.z < 0
-        if flip_all != self.flip:
-            for f in faces:
-                f.normal_flip()
-
-    def _assign_material(self, faces, a):
-        new = set(faces)
-        src = None
-        for v in a:
-            src = next((f for f in v.link_faces if f not in new), None)
-            if src:
-                break
-        for f in faces:
-            if src:
-                f.material_index = src.material_index
-                f.smooth = src.smooth
-
-    def _write_uv(self, bm, grid, closed, mw):
-        layer = bm.loops.layers.uv.active
-        if layer is None:
-            return
-        rows = len(grid) - 1
-        a, b = grid[0], grid[-1]
-        wa = [mw @ v.co for v in a]
-        wb = [mw @ v.co for v in b]
-        _, len_a = _arc_params(wa, closed)
-        _, len_b = _arc_params(wb, closed)
-        width = sum((x - y).length for x, y in zip(wa, wb)) / max(1, len(wa))
-        along_a, _ = _arc_params(wa, closed)
-        along_b, _ = _arc_params(wb, closed)
-        length = 0.5 * (len_a + len_b)
-        uv_of = {}
-        for r, row in enumerate(grid):
-            t = r / rows
-            for k, v in enumerate(row):
-                s = along_a[k] * (1 - t) + along_b[k] * t
-                uv_of[v] = (t * width * self.uv_scale, s * length * self.uv_scale)
-        seam_v = (length * self.uv_scale) if closed else None
-        for f in self._faces:
-            if not all(v in uv_of for v in f.verts):
-                continue
-            vs = [uv_of[l.vert][1] for l in f.loops]
-            wrap = closed and max(vs) - min(vs) > 0.5 * seam_v
-            for l in f.loops:
-                u, vv = uv_of[l.vert]
-                if wrap and vv < 0.5 * seam_v:
-                    vv += seam_v
-                l[layer].uv = (u, vv)
+def draw_params(layout, data, prefix):
+    col = layout.column()
+    row = col.row(align=True)
+    row.prop(data, prefix + "rows")
+    row.prop(data, prefix + "segments")
+    col.prop(data, prefix + "slope_mode")
+    col.prop(data, prefix + "relax")
+    col.separator()
+    col.prop(data, prefix + "bulge")
+    col.prop(data, prefix + "shape")
+    col.prop(data, prefix + "bias")
+    col.prop(data, prefix + "end_taper")
+    col.separator()
+    col.prop(data, prefix + "flip")
+    col.prop(data, prefix + "uv_strip")
+    sub = col.column()
+    sub.enabled = getattr(data, prefix + "uv_strip")
+    sub.prop(data, prefix + "uv_scale")
 
 
 def _menu(self, context):
