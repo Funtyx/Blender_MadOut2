@@ -21,6 +21,7 @@ for _name in [n for n in sys.modules if n.startswith(__name__ + ".")]:
 from . import (
     ground_fill,
     strip_resample,
+    road_remesh,
     stairs,
     big_edge_length,
     panel,
@@ -30,6 +31,7 @@ from . import (
 TOOLS = (
     ground_fill,
     strip_resample,
+    road_remesh,
     stairs,
     big_edge_length,
     panel,

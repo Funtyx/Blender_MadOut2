@@ -10,13 +10,14 @@ import textwrap
 import bpy
 from bpy.props import BoolProperty, PointerProperty
 
-from . import big_edge_length, ground_fill, preview, stairs, strip_resample
+from . import big_edge_length, ground_fill, preview, road_remesh, stairs, strip_resample
 from .ui_help import draw_help
 
 SR = strip_resample.MESH_OT_strip_resample
 GF = ground_fill.MESH_OT_ground_fill
 ST = stairs.MESH_OT_stairs_from_face
-PREVIEWS = ("preview_sr", "preview_gf", "preview_st")
+RR = road_remesh.MESH_OT_road_remesh
+PREVIEWS = ("preview_sr", "preview_rr", "preview_gf", "preview_st")
 
 
 def _only_one_preview(owner):
@@ -38,7 +39,8 @@ def _build_settings():
     ann.update({"sr_" + k: SR.__annotations__[k] for k in strip_resample.PARAM_KEYS})
     ann.update({"gf_" + k: GF.__annotations__[k] for k in ground_fill.PARAM_KEYS})
     ann.update({"st_" + k: ST.__annotations__[k] for k in stairs.PARAM_KEYS})
-    for key, title in (("sr", "Strip Resample"), ("gf", "Ground Fill"), ("st", "Stairs")):
+    ann.update({"rr_" + k: RR.__annotations__[k] for k in road_remesh.PARAM_KEYS})
+    for key, title in (("sr", "Strip Resample"), ("rr", "Road Remesh"), ("gf", "Ground Fill"), ("st", "Stairs")):
         ann["show_" + key] = BoolProperty(name="Параметры " + title, default=True)
         ann["help_" + key] = BoolProperty(name="Помощь", default=False)
         ann["preview_" + key] = BoolProperty(
@@ -99,6 +101,8 @@ class MADOUT2V2_PT_tools(bpy.types.Panel):
         col.enabled = context.mode == 'EDIT_MESH'
         _tool(col, s, "sr", "Strip Resample", SR, strip_resample.PARAM_KEYS,
               strip_resample.draw_params, strip_resample.HELP, count_text="Сегментов (0 = как сейчас)")
+        _tool(col, s, "rr", "Road Remesh", RR, road_remesh.PARAM_KEYS,
+              road_remesh.draw_params, road_remesh.HELP)
         _tool(col, s, "gf", "Ground Fill", GF, ground_fill.PARAM_KEYS,
               ground_fill.draw_params, ground_fill.HELP)
         _tool(col, s, "st", "Stairs", ST, stairs.PARAM_KEYS,
