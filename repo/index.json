@@ -7,16 +7,16 @@
       "id": "madout2_v2",
       "name": "MadOut2 V2",
       "tagline": "Strip Resample, Ground Fill \u0438 Big Edge Length \u0434\u043b\u044f MadOut2",
-      "version": "1.2.1",
+      "version": "1.2.2",
       "type": "add-on",
       "maintainer": "Funtyx",
       "license": [
         "SPDX:GPL-3.0-or-later"
       ],
       "blender_version_min": "5.1.0",
-      "archive_url": "./madout2_v2-1.2.1.zip",
-      "archive_size": 32008,
-      "archive_hash": "sha256:0a553f4ec997ad66c957a51d1982538a8531db2668100b73685838e1264b83fd"
+      "archive_url": "./madout2_v2-1.2.2.zip",
+      "archive_size": 32623,
+      "archive_hash": "sha256:38dff47a4447332ffa4d5ccd054cd7c20bda10ae59087fa3ddc1b688b15ac4e7"
     },
     {
       "schema_version": "1.0.0",

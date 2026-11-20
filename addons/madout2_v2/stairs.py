@@ -127,6 +127,7 @@ class StairsCore:
                     raise _Fail("Два ската касаются боками — делайте их по одному")
                 side_edges[e] = f
 
+        self._landings = {f for f in faces_in if f not in ramps}
         self.summary = []
         result = []
         for face in ramps:
@@ -139,6 +140,17 @@ class StairsCore:
         if self.flip_direction:
             (b0, b1), (t0, t1) = (t0, t1), (b0, b1)
         material, uv_layer = face.material_index, bm.loops.layers.uv.active
+        # Walls continue along selected flat landings at both ends of the flight
+        landing_far = {}
+        for end, (c0, c1) in (('start', (b0, b1)), ('end', (t0, t1))):
+            e = bm.edges.get((c0, c1))
+            landing = next((f for f in e.link_faces if f in self._landings), None) if e else None
+            for side_i, c in enumerate((c0, c1)):
+                if landing is None:
+                    continue
+                side_e = next((x for x in c.link_edges if x is not e and landing in x.link_faces), None)
+                if side_e is not None:
+                    landing_far[(end, side_i)] = mw @ side_e.other_vert(c).co
 
         sides = []
         for b, t in ((b0, t0), (b1, t1)):
@@ -217,7 +229,8 @@ class StairsCore:
                     outer_pts = [wb + d * (k / n) + out * self.wall_thickness for k in range(n + 1)]
                     outer_verts = None
                 faces += self._wall(bm, chain, nose, sides[i], out, outer_pts, outer_verts, n, top_z,
-                                    height < 0, material, uv_layer, mw, inv)
+                                    height < 0, material, uv_layer, mw, inv,
+                                    landing_far.get(('start', i)), landing_far.get(('end', i)))
         return faces
 
     @staticmethod
@@ -262,7 +275,7 @@ class StairsCore:
         return new_sides, corners
 
     def _wall(self, bm, chain, nose, side, outward, outer_pts, outer_verts, n, top_z, cut, material, uv_layer,
-              mw, inv):
+              mw, inv, far_start=None, far_end=None):
         """Side wall with thickness: inner face welded to the step profile, flat or sloped top.
         outer_pts — the wall's outer bottom line; outer_verts — existing vertices there (walls inside)."""
         _, _, wb, d = side
@@ -305,9 +318,17 @@ class StairsCore:
             add([bottom_out[k], bottom_out[k + 1], top_out[k + 1], top_out[k]], outward)
             add([top[k], top[k + 1], top_out[k + 1], top_out[k]], up)
         # Cut-in: the first riser hangs below the ramp line, so the wall end starts at the line itself
-        start = ([chain[0]] if cut else [chain[0], nose[0]]) + [top[0], top_out[0], bottom_out[0]]
-        add(start, -fwd)
-        add([chain[n], top[n], top_out[n], bottom_out[n]], fwd)
+        inner_start = [chain[0]] if cut else [chain[0], nose[0]]
+        if far_start is not None and (far_start - (mw @ chain[0].co)).dot(fwd) < -1e-4:
+            self._landing_wall(add, new, far_start, -fwd, outward, inner_start, top[0], top_out[0], bottom_out[0],
+                               tops[0].z, reverse=True)
+        else:
+            add(inner_start + [top[0], top_out[0], bottom_out[0]], -fwd)
+        if far_end is not None and (far_end - (mw @ chain[n].co)).dot(fwd) > 1e-4:
+            self._landing_wall(add, new, far_end, fwd, outward, [chain[n]], top[n], top_out[n], bottom_out[n],
+                               tops[n].z, reverse=False)
+        else:
+            add([chain[n], top[n], top_out[n], bottom_out[n]], fwd)
 
         if uv_layer is not None:
             sc = self.uv_scale
@@ -323,6 +344,25 @@ class StairsCore:
                         uv = (p.dot(fwd), p.z)
                     l[uv_layer].uv = (uv[0] * sc, uv[1] * sc)
         return made
+
+    def _landing_wall(self, add, new, far, away, outward, inner_join, join_top, top_out_j, bottom_out_j, z,
+                      reverse):
+        """Wall continued along a flat landing: same top height as the flight wall where they meet."""
+        th = self.wall_thickness
+        if self.wall_side == 'IN':
+            inner_far, outer_far = far - outward * th, far.copy()
+        else:
+            inner_far, outer_far = far.copy(), far + outward * th
+        lin = new(inner_far)
+        lbout = new(outer_far)
+        ltop = new(Vector((inner_far.x, inner_far.y, z)))
+        ltop_out = new(Vector((outer_far.x, outer_far.y, z)))
+        up = Vector((0.0, 0.0, 1.0))
+        inner = [lin] + inner_join + [join_top, ltop] if reverse else inner_join + [lin, ltop, join_top]
+        add(inner, -outward)
+        add([lbout, bottom_out_j, top_out_j, ltop_out], outward)
+        add([ltop, join_top, top_out_j, ltop_out], up)
+        add([lin, ltop, ltop_out, lbout], away)
 
     def _uv(self, layer, pieces, built, lc, rc, ln, rn, sides, riser, tread, mw):
         sc = self.uv_scale
