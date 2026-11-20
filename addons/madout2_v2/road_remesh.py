@@ -911,8 +911,29 @@ class RoadRemeshCore:
             p[2] += 1
         out = []
         for x, y, c in parts:
-            out += [x + (y - x) * i / c for i in range(c)]
+            out += self._spread(L, x, y, c)
         out.append(b)
+        return out
+
+    def _spread(self, L, x, y, c):
+        """c edges from x towards y: even by angle and length together, so a sharp turn inside
+        a long bend keeps its points (on a round fillet this is the same as even by length)."""
+        if c < 2 or self._count(L, x, y)[2] not in ('arc', 'line'):
+            return [x + (y - x) * i / c for i in range(c)]
+        params, cum = self._turning(L, x, y)
+        acc = [0.0]
+        for i in range(1, len(params)):
+            acc.append(acc[-1] + abs(cum[i] - cum[i - 1]) / (math.pi / 2) * self.seg_90
+                       + (params[i] - params[i - 1]) / self.edge_length)
+        if acc[-1] < 1e-9:
+            return [x + (y - x) * i / c for i in range(c)]
+        out, j = [], 0
+        for i in range(c):
+            t = acc[-1] * i / c
+            while j < len(acc) - 2 and acc[j + 1] < t:
+                j += 1
+            f = (t - acc[j]) / (acc[j + 1] - acc[j]) if acc[j + 1] > acc[j] else 0.0
+            out.append(params[j] + (params[j + 1] - params[j]) * f)
         return out
 
     def _side_pieces(self, L, s0, s1):
@@ -1260,29 +1281,37 @@ class RoadRemeshCore:
             if f1 - f0 < 1e-4:
                 return None
             fan[g] = (f0, f1)
-            # the curbs before and after the bend, turned a little into the road, meet at the hub;
-            # straight on they would meet at a cusp and the first quads of the fan would be slivers
-            h = min(0.3, (f1 - f0) / 2.0)
+            # lines from the bend ends along the arms meet where the curbs would make a sharp corner;
+            # the hub sits a little further into the road, or the first quads of the fan would be slivers.
+            # The arm directions, not the curb there: a broken curb would send the hub astray
             a0, a1 = L.at(f0), L.at(f1)
             p0, p1 = frame.to2(a0), frame.to2(a1)
-            e0 = p0 - frame.to2(L.at(f0 - h))
-            e1 = frame.to2(L.at(f1 + h)) - p1
-            turn = abs(self._turning(L, f0, f1)[1][-1])
+            e0, e1 = self._arm_dir(arm_keys[g]), -self._arm_dir(arm_keys[(g + 1) % k])
+            # a dead end has no curbs of its own: it heads in square to its edge
+            if e0.length < 0.5:
+                e0 = inward(g)
+            if e1.length < 0.5:
+                e1 = -inward((g + 1) % k)
+            if e0.length < 0.5 or e1.length < 0.5:
+                return None
+            turn = abs(_signed_angle(e0, e1))
             if not math.radians(20.0) < turn < math.radians(160.0):
                 return None
-            tilt = turn / 6.0
-            e0 = Matrix.Rotation(tilt, 2) @ e0
-            e1 = Matrix.Rotation(-tilt, 2) @ -e1
+            e1 = -e1
             den = _cross2(e0, e1)
-            if abs(den) < 1e-9 * e0.length * e1.length:
+            if abs(den) < 1e-9:
                 return None
             u, v = _cross2(p1 - p0, e1) / den, _cross2(p1 - p0, e0) / den
             if u <= 0 or v <= 0:
                 return None
-            q = p0 + e0 * u
+            sharp = p0 + e0 * u
             m = self._half_turn(L, f0, f1)
-            if (q - L.at2(m)).dot(L.normal2(m)) <= 0.05:
+            out = sharp - L.at2(m)
+            if out.dot(L.normal2(m)) <= 0.05:
                 return None
+            # as far past the sharp corner as the fillet is short of it, but not across the arms
+            widths = [(self._key_pos2(arm_keys[x][0]) - self._key_pos2(arm_keys[x][-1])).length for x in (g, (g + 1) % k)]
+            q = sharp + out.normalized() * min(out.length, 0.25 * min(widths))
             up = frame.up
             corner[g] = frame.e1 * q.x + frame.e2 * q.y + up * ((a0.dot(up) + a1.dot(up)) / 2.0)
 
@@ -1318,13 +1347,26 @@ class RoadRemeshCore:
                     return None
             depth.append(n)
 
+        taken = {}
+
         def chain(g, at_end, n):
             """Side of an arm's rows from the mouth inwards: along the curb, then into the hub at a fillet.
             Params only, so a count that does not fit leaves no stations behind."""
             r = rail(g, at_end)
             along = n if walls[g] else n - 1
+            taken.pop((g, at_end), None)
             if along and r is None:
-                return None
+                # no straight curb here: the rows the other side needs come off the end of the fillet
+                L = span(g)[0]
+                f0, f1 = fan[g]
+                other = 0
+                if (g, not at_end) in taken:
+                    other = sum(1 for x in self._place(L, f0, f1, part(L, f0, f1))
+                                if (x > taken[(g, False)] if at_end else x < taken[(g, True)]))
+                xs = self._place(L, f0, f1, max(part(L, f0, f1), along + other + 2))
+                cut = xs[-1 - along] if at_end else xs[along]
+                r = (L, cut, f1) if at_end else (L, f0, cut)
+                taken[(g, at_end)] = cut
             if along:
                 L, x0, x1 = r
                 xs = self._place(L, x0, x1, along)
@@ -1344,24 +1386,11 @@ class RoadRemeshCore:
                 ks.append(key)
             return ks
 
-        # the fans first: their stations are tried before any is kept
-        fans = []
-        for g in sorted(fan):
-            L, f0, f1 = span(g)[0], fan[g][0], fan[g][1]
-            n = part(L, f0, f1)
-            n += n % 2
-            xs = self._place(L, f0, f1, n)
-            if (len(xs) - 1) % 2:
-                xs = self._place(L, f0, f1, len(xs))
-            if (len(xs) - 1) % 2:
-                return None
-            fans.append((g, L, xs))
-
-        ext = []
+        specs = []
         for a in range(k):
             n = depth[a]
             if n == 0:
-                ext.append(None)
+                specs.append(None)
                 continue
             g0, g1 = (a - 1) % k, a
             # kept points on a curb may ask for more rows: the other side takes as many
@@ -1373,7 +1402,29 @@ class RoadRemeshCore:
                 if size == n:
                     break
                 n = size
-            left, right = keys(g0, left), keys(g1, right)
+            specs.append((left, right, n))
+
+        # fillets: an even number of edges, every second fillet point joined to the hub
+        fans = []
+        for g in sorted(fan):
+            L = span(g)[0]
+            f0, f1 = taken.get((g, False), fan[g][0]), taken.get((g, True), fan[g][1])
+            n = max(2, part(L, f0, f1))
+            n += n % 2
+            xs = self._place(L, f0, f1, n)
+            if (len(xs) - 1) % 2:
+                xs = self._place(L, f0, f1, len(xs))
+            if (len(xs) - 1) % 2:
+                return None
+            fans.append((g, L, xs))
+
+        ext = []
+        for spec in specs:
+            if spec is None:
+                ext.append(None)
+                continue
+            left, right, n = spec
+            left, right = keys((len(ext) - 1) % k, left), keys(len(ext), right)
             if len(left) != n + 1 or len(right) != n + 1:
                 return None
             for r in range(n):
@@ -1404,6 +1455,17 @@ class RoadRemeshCore:
         if not self._convex(ring):
             return None
         return {"arms": arm_keys, "w": arm_w, "ext": ext, "fans": fan_keys, "centre": self._centre_keys(centre)}
+
+    def _arm_dir(self, keys):
+        """Where an arm heads into the junction: along both of its curbs at the mouth (a mouth may be slanted)."""
+        out = Vector((0.0, 0.0))
+        for key, sign in ((keys[0], -1.0), (keys[-1], 1.0)):
+            if key[0] == "M" or key in self._extra:
+                continue
+            L = self._loops[key[0]]
+            s = self._st[key[0]][key[1]]
+            out += L.tangent2(s - 0.5 * sign) * sign
+        return out.normalized() if out.length > 1e-9 else out
 
     def _convex(self, keys, strict=True):
         """The patch corners run counter-clockwise and none of them bends back."""
