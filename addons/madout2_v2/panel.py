@@ -78,7 +78,9 @@ def _tool(layout, s, key, title, op_cls, keys, draw_params, help_lines, count_te
             _wrapped(box, error, 'ERROR')
         elif info:
             _wrapped(box, info, 'INFO')
-    draw_help(box, s, "help_" + key, help_lines)
+    if is_open:
+        # Помощь живёт внутри секции инструмента и сворачивается вместе с ней
+        draw_help(box, s, "help_" + key, help_lines)
 
 
 class MADOUT2V2_PT_tools(bpy.types.Panel):

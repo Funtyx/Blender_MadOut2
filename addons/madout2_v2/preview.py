@@ -18,7 +18,8 @@ PREVIEW_COLOR = (0.15, 1.0, 0.55, 0.95)
 SURFACE_COLOR = Vector((0.62, 0.66, 0.6))
 LIGHT = Vector((0.35, -0.45, 0.82)).normalized()
 
-_state = {"key": None, "lines": [], "batch": None, "tris": None, "tri_batch": None, "error": "", "info": ""}
+_state = {"key": None, "lines": [], "batch": None, "tris": None, "tri_batch": None, "on_top": False,
+          "error": "", "info": ""}
 _handle = None
 
 _TOOLS = {
@@ -122,8 +123,8 @@ def _redraw():
                 area.tag_redraw()
 
 
-def _set(lines, tris, error, info):
-    _state.update(lines=lines, batch=None, tris=tris, tri_batch=None, error=error, info=info)
+def _set(lines, tris, error, info, on_top=False):
+    _state.update(lines=lines, batch=None, tris=tris, tri_batch=None, on_top=on_top, error=error, info=info)
     _redraw()
 
 
@@ -142,7 +143,8 @@ def _timer():
         key = (tool, params, _signature(obj), tuple(obj.matrix_world.col[3]))
         if key != _state["key"]:
             _state["key"] = key
-            _set(*_compute(obj, tool, s))
+            # Stairs replace the selected face, so the old face must not hide them in the preview
+            _set(*_compute(obj, tool, s), on_top=(tool == 'ST'))
     except Exception as ex:
         _state["error"] = f"Ошибка предпросмотра: {ex}"
     return 0.15
@@ -154,8 +156,14 @@ def _draw():
         shader = gpu.shader.from_builtin('SMOOTH_COLOR')
         if _state["tri_batch"] is None:
             _state["tri_batch"] = batch_for_shader(shader, 'TRIS', {"pos": tris[0], "color": tris[1]})
-        gpu.state.depth_test_set('LESS_EQUAL')
-        gpu.state.depth_mask_set(True)
+        if _state["on_top"]:
+            gpu.state.depth_test_set('LESS_EQUAL')
+            gpu.state.depth_mask_set(True)
+            # own depth only: clear the scene depth so the old face and walls do not cover the stairs
+            gpu.state.active_framebuffer_get().clear(depth=1.0)
+        else:
+            gpu.state.depth_test_set('LESS_EQUAL')
+            gpu.state.depth_mask_set(True)
         gpu.state.face_culling_set('NONE')
         shader.bind()
         _state["tri_batch"].draw(shader)
@@ -193,4 +201,4 @@ def unregister():
     if _handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_handle, 'WINDOW')
         _handle = None
-    _state.update(key=None, lines=[], batch=None, tris=None, tri_batch=None, error="", info="")
+    _state.update(key=None, lines=[], batch=None, tris=None, tri_batch=None, on_top=False, error="", info="")
