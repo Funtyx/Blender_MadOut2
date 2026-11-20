@@ -1,7 +1,8 @@
 # =====================================================
 # Road Remesh — пересобирает сетку всей дорожной сети: полосы между
 # бордюрами, изгибы и развязки. Скругления делятся по углу (одинаково
-# на всех сторонах), прямые — по длине ребра, развязки — сеткой.
+# на всех сторонах), прямые — по длине ребра. На развязках полосы идут
+# насквозь через сетку в центре, а скругления сходятся к её углам веером.
 # Бордюры пересобираются по тем же точкам: ряды, высоты и UV сохраняются.
 # Edit Mode → выделить дорогу с бордюрами (A) → Road Remesh.
 # =====================================================
@@ -30,8 +31,9 @@ HELP = (
     "Что делает: заново раскладывает",
     "сетку всей дороги. Полосы между",
     "бордюрами и изгибы — ровные квады,",
-    "развязки — полосы идут через",
-    "скругления, в центре сетка.",
+    "развязки — полосы идут насквозь",
+    "через сетку в центре, скругления",
+    "сходятся веером к её углам.",
     "Скругления остаются плавными.",
     "",
     "Что выделить: дорогу вместе",
@@ -1005,9 +1007,11 @@ class RoadRemeshCore:
         pieces = [p for p in pieces if p.kind == "mouth" or p.s1 - p.s0 > 1e-4]
         pieces = self._merge_caps(self._merge_short(pieces))
         if self.junction_mode == 'GRID':
+            saved = {i: dict(st) for i, st in self._st.items()}
             plus = self._plus(pieces)
             if plus is not None:
                 return ("plus", pieces, plus)
+            self._st = saved
         corners = self._pick_corners(pieces) if self.junction_mode == 'GRID' else None
         if corners is not None:
             plan = self._balance(pieces, corners)
@@ -1035,18 +1039,22 @@ class RoadRemeshCore:
 
     def _half_turn(self, L, a, b):
         """Where a fillet has turned half of its angle: the split is even on any fillet."""
+        return self._turn_at(L, a, b, 0.5)
+
+    def _turn_at(self, L, a, b, frac):
+        """Where a fillet has turned the given share of its angle."""
         if b - a < 1e-4:
             return a
         params, cum = self._turning(L, a, b)
-        half = cum[-1] / 2.0
-        if abs(half) < math.radians(2.0):
-            return (a + b) / 2.0
+        half = cum[-1] * frac
+        if abs(cum[-1]) < math.radians(4.0):
+            return a + (b - a) * frac
         for i in range(1, len(cum)):
             lo, hi = cum[i - 1], cum[i]
             if (lo - half) * (hi - half) <= 0 and hi != lo:
                 f = (half - lo) / (hi - lo)
                 return params[i - 1] + (params[i] - params[i - 1]) * f
-        return (a + b) / 2.0
+        return a + (b - a) * frac
 
     def _merge_short(self, pieces):
         """Tiny straight bits between a strip end and a fillet join the neighbour (not across a kept corner)."""
@@ -1152,6 +1160,13 @@ class RoadRemeshCore:
             d = p1 - p0
             return Vector((-d.y, d.x)).normalized() if d.length > 1e-9 else Vector((0.0, 0.0))
 
+        # a layout that does not fit must not leave its stations on the curbs
+        saved = {i: dict(st) for i, st in self._st.items()}
+        lanes = self._lanes(pieces, groups, walls, arm_keys, arm_w, span, inward)
+        if lanes is not None:
+            return lanes
+        self._st = saved
+
         # fillet corners: one split in the middle of the turn
         splits = [None] * k
         for a, grp in enumerate(groups):
@@ -1159,59 +1174,12 @@ class RoadRemeshCore:
                 continue
             L, s0, s1 = span(a)
             splits[a] = [self._half_turn(L, s0, s1)]
-        # straight walls across from a mouth: the strips run on to where the opposite fillet ends
-        for a, grp in enumerate(groups):
-            if not walls[a]:
-                continue
-            L, s0, s1 = span(a)
-            d1 = d2 = 0.0
-            prev = (a - 1) % k
-            if not walls[prev]:
-                Lp = span(prev)[0]
-                d1 = max(0.0, (Lp.at2(splits[prev][0]) - self._key_pos2(arm_keys[a][-1])).dot(inward(a)))
-            nxt = (a + 1) % k
-            if not walls[nxt]:
-                Ln = span(nxt)[0]
-                d2 = max(0.0, (Ln.at2(splits[nxt][0]) - self._key_pos2(arm_keys[nxt][0])).dot(inward(nxt)))
-            ln = s1 - s0
-            if d1 + d2 > 0.9 * ln:
-                f = 0.9 * ln / (d1 + d2)
-                d1, d2 = d1 * f, d2 * f
-            pts = [s0 + d1]
-            if walls[a] == 2:
-                inner = [pieces[x].s0 for x in grp[1:]]
-                if inner:
-                    turns = [(_signed_angle(self._tangent(pieces[grp[n - 1]], True), self._tangent(pieces[grp[n]], False)),
-                              pieces[grp[n]].s0) for n in range(1, len(grp))]
-                    sharp = max(turns)[1]
-                else:
-                    sharp = (s0 + s1) / 2.0
-                if not s0 + d1 < sharp < s1 - d2:
+        for a in range(k):
+            if walls[a]:
+                splits[a] = self._wall_splits(pieces, groups, walls, a, span, inward, arm_keys,
+                                              lambda b: span(b)[0].at2(splits[b][0]))
+                if splits[a] is None:
                     return None
-                pts.append(sharp)
-            elif walls[a] > 2:
-                return None
-            pts.append(s1 - d2)
-            # a kept vertex inside a centre wall would need more edges than the mouth across;
-            # move the split onto it, so the strip running through takes it instead
-            kept = sorted({_unwrap(L.vparam(i), s0, L.total) for i in L.anchor})
-            if len(pts) == 2:
-                mid = (pts[0] + pts[1]) / 2.0
-                inside = [q for q in kept if pts[0] + 1e-4 < q < pts[1] - 1e-4]
-                before = [q for q in inside if q <= mid]
-                after = [q for q in inside if q > mid]
-                if before:
-                    pts[0] = before[-1]
-                if after:
-                    pts[1] = after[0]
-            else:
-                first = [q for q in kept if pts[0] + 1e-4 < q < pts[1] - 1e-4]
-                second = [q for q in kept if pts[1] + 1e-4 < q < pts[2] - 1e-4]
-                if first:
-                    pts[0] = first[-1]
-                if second:
-                    pts[2] = second[0]
-            splits[a] = pts
 
         def part(L, a, b):
             return sum(p[2] for p in self._alloc(L, a, b))
@@ -1229,26 +1197,9 @@ class RoadRemeshCore:
                 return None
             ext.append((r1, r2, n))
 
-        # centre: rungs across the arms and wall pieces between the splits
-        sides = []
-        for a in range(k):
-            sides.append(("rung", a, arm_w[a]))
-            L, _, _ = span(a)
-            for x, y in zip(splits[a], splits[a][1:]):
-                sides.append(("wall", (L, x, y), None))
-        # a dead end: the arms meet the walls, so the centre starts at the arm itself
-        counts = [sd[2] for sd in sides]
-        # a wall across a mouth takes the mouth's count (at least one edge per piece between kept points);
-        # two walls facing each other share the larger count by angle and length
-        need = [len(self._alloc(*sd[1], anchors_only=True)) if sd[0] == "wall" else sd[2] for sd in sides]
-        for c in range(4):
-            if counts[c] is None:
-                o = (c + 2) % 4
-                counts[c] = max(part(*sides[c][1]), part(*sides[o][1])) if counts[o] is None else counts[o]
-        if counts[0] != counts[2] or counts[1] != counts[3] or any(c < nd for c, nd in zip(counts, need)):
+        centre = self._plus_centre(splits, span, arm_w)
+        if centre is None:
             return None
-
-        # station keys
         ext_keys = []
         for a, (r1, r2, n) in enumerate(ext):
             if n == 0:
@@ -1260,16 +1211,299 @@ class RoadRemeshCore:
             k2 = [self._add_st(L2, y) for y in self._place(L2, y0, y1, n)]
             if len(k1) != len(k2):
                 return None
-            n = len(k1) - 1
-            ext_keys.append((k1, k2, n))
-        centre = []
-        for c, sd in enumerate(sides):
-            if sd[0] == "wall":
-                L, x, y = sd[1]
-                centre.append([self._add_st(L, t) for t in self._place(L, x, y, counts[c])])
+            # side chains from the mouth inwards
+            ext_keys.append((list(reversed(k1)), k2, len(k1) - 1))
+        return {"arms": arm_keys, "w": arm_w, "ext": ext_keys, "fans": [], "centre": self._centre_keys(centre)}
+
+    def _lanes(self, pieces, groups, walls, arm_keys, arm_w, span, inward):
+        """Junction with the lanes running straight through: the arms run on to a centre grid,
+        and each fillet is a fan of quads coming in to a hub at the corner of that grid."""
+        k = len(groups)
+        jid = len(self._junction_data)
+        frame = self._frame
+        long_enough = 0.3 * self.edge_length
+
+        def part(L, a, b):
+            return sum(p[2] for p in self._alloc(L, a, b))
+
+        # a fillet may start and end with straight curb: that curb runs on with the arm, the bend is the fan
+        bend = {}
+        for g in range(k):
+            if walls[g]:
+                continue
+            L, s0, s1 = span(g)
+            if s1 - s0 < 1e-4:
+                return None
+            arcs = [pieces[x] for x in groups[g] if pieces[x].kind == "arc"]
+            bend[g] = (arcs[0].s0, arcs[-1].s1) if arcs else (s0, s1)
+
+        def straight(g, at_end):
+            L, s0, s1 = span(g)
+            t0, t1 = bend[g]
+            return (L, t1, s1) if at_end else (L, s0, t0)
+
+        # which straight curbs run on: on both sides of an arm, or next to a wall
+        use = {}
+        for a in range(k):
+            sides = (((a - 1) % k, True), (a, False))
+            fil = [(g, e) for g, e in sides if not walls[g]]
+            ok = all(straight(g, e)[2] - straight(g, e)[1] >= long_enough for g, e in fil)
+            for g, e in fil:
+                use[(g, e)] = ok
+
+        fan = {}
+        corner = {}
+        for g in bend:
+            L, s0, s1 = span(g)
+            f0 = bend[g][0] if use[(g, False)] else s0
+            f1 = bend[g][1] if use[(g, True)] else s1
+            if f1 - f0 < 1e-4:
+                return None
+            fan[g] = (f0, f1)
+            # the curbs before and after the bend, turned a little into the road, meet at the hub;
+            # straight on they would meet at a cusp and the first quads of the fan would be slivers
+            h = min(0.3, (f1 - f0) / 2.0)
+            a0, a1 = L.at(f0), L.at(f1)
+            p0, p1 = frame.to2(a0), frame.to2(a1)
+            e0 = p0 - frame.to2(L.at(f0 - h))
+            e1 = frame.to2(L.at(f1 + h)) - p1
+            turn = abs(self._turning(L, f0, f1)[1][-1])
+            if not math.radians(20.0) < turn < math.radians(160.0):
+                return None
+            tilt = turn / 6.0
+            e0 = Matrix.Rotation(tilt, 2) @ e0
+            e1 = Matrix.Rotation(-tilt, 2) @ -e1
+            den = _cross2(e0, e1)
+            if abs(den) < 1e-9 * e0.length * e1.length:
+                return None
+            u, v = _cross2(p1 - p0, e1) / den, _cross2(p1 - p0, e0) / den
+            if u <= 0 or v <= 0:
+                return None
+            q = p0 + e0 * u
+            m = self._half_turn(L, f0, f1)
+            if (q - L.at2(m)).dot(L.normal2(m)) <= 0.05:
+                return None
+            up = frame.up
+            corner[g] = frame.e1 * q.x + frame.e2 * q.y + up * ((a0.dot(up) + a1.dot(up)) / 2.0)
+
+        splits = [[] for _ in range(k)]
+        for g in range(k):
+            if walls[g]:
+                splits[g] = self._wall_splits(pieces, groups, walls, g, span, inward, arm_keys,
+                                              lambda b: frame.to2(corner[b]))
+                if splits[g] is None:
+                    return None
+
+        def rail(g, at_end):
+            """Curb an arm runs on along: up to the split on a wall, the straight before the bend at a fillet."""
+            L, s0, s1 = span(g)
+            if walls[g]:
+                return (L, splits[g][-1], s1) if at_end else (L, s0, splits[g][0])
+            if not use[(g, at_end)]:
+                return None
+            return straight(g, at_end)
+
+        # rows each arm runs on by: as many as its curbs need, plus the one into the hub at a fillet
+        depth = []
+        for a in range(k):
+            sides = (((a - 1) % k, True), (a, False))
+            rails = [rail(g, e) for g, e in sides]
+            hubs = sum(1 for g, _ in sides if not walls[g])
+            if hubs and any(r is None for r in rails):
+                n = 1
             else:
-                centre.append(("rung", sd[1]))
-        return {"arms": arm_keys, "w": arm_w, "ext": ext_keys, "centre": centre}
+                n = max(part(*r) for r in rails) + (1 if hubs else 0)
+            for (g, e), r in zip(sides, rails):
+                if walls[g] and n and r[2] - r[1] < 1e-4:
+                    return None
+            depth.append(n)
+
+        def chain(g, at_end, n):
+            """Side of an arm's rows from the mouth inwards: along the curb, then into the hub at a fillet.
+            Params only, so a count that does not fit leaves no stations behind."""
+            r = rail(g, at_end)
+            along = n if walls[g] else n - 1
+            if along and r is None:
+                return None
+            if along:
+                L, x0, x1 = r
+                xs = self._place(L, x0, x1, along)
+                if at_end:
+                    xs.reverse()
+            else:
+                L, s0, s1 = span(g)
+                xs = [s1 if at_end else s0]
+            return L, xs, not walls[g]
+
+        def keys(g, spec):
+            L, xs, hub = spec
+            ks = [self._add_st(L, x) for x in xs]
+            if hub:
+                key = ("Q", jid, g, "P")
+                self._extra[key] = corner[g]
+                ks.append(key)
+            return ks
+
+        # the fans first: their stations are tried before any is kept
+        fans = []
+        for g in sorted(fan):
+            L, f0, f1 = span(g)[0], fan[g][0], fan[g][1]
+            n = part(L, f0, f1)
+            n += n % 2
+            xs = self._place(L, f0, f1, n)
+            if (len(xs) - 1) % 2:
+                xs = self._place(L, f0, f1, len(xs))
+            if (len(xs) - 1) % 2:
+                return None
+            fans.append((g, L, xs))
+
+        ext = []
+        for a in range(k):
+            n = depth[a]
+            if n == 0:
+                ext.append(None)
+                continue
+            g0, g1 = (a - 1) % k, a
+            # kept points on a curb may ask for more rows: the other side takes as many
+            for _ in range(2):
+                left, right = chain(g0, True, n), chain(g1, False, n)
+                if left is None or right is None:
+                    return None
+                size = max(len(sp[1]) + sp[2] for sp in (left, right)) - 1
+                if size == n:
+                    break
+                n = size
+            left, right = keys(g0, left), keys(g1, right)
+            if len(left) != n + 1 or len(right) != n + 1:
+                return None
+            for r in range(n):
+                if not self._convex([left[r], right[r], right[r + 1], left[r + 1]], strict=False):
+                    return None
+            ext.append((left, right, n))
+
+        fan_keys = []
+        for g, L, xs in fans:
+            hub = ("Q", jid, g, "P")
+            ks = [self._add_st(L, x) for x in xs]
+            for i in range(0, len(ks) - 2, 2):
+                if not self._convex([hub, ks[i], ks[i + 1], ks[i + 2]], strict=False):
+                    return None
+            fan_keys.append((hub, ks))
+
+        centre = self._plus_centre(splits, span, arm_w)
+        if centre is None:
+            return None
+        ring = []
+        for sd in centre:
+            if sd[0] == "rung":
+                e = ext[sd[1]]
+                ring.append(e[0][-1] if e else arm_keys[sd[1]][0])
+            else:
+                L, x, _ = sd[1]
+                ring.append(self._add_st(L, x))
+        if not self._convex(ring):
+            return None
+        return {"arms": arm_keys, "w": arm_w, "ext": ext, "fans": fan_keys, "centre": self._centre_keys(centre)}
+
+    def _convex(self, keys, strict=True):
+        """The patch corners run counter-clockwise and none of them bends back."""
+        pts = [self._key_pos2(key) for key in keys]
+        area = 0.0
+        for i in range(len(pts)):
+            a, b, c = pts[i - 1], pts[i], pts[(i + 1) % len(pts)]
+            area += _cross2(a, b)
+            if strict and _cross2(b - a, c - b) <= 0:
+                return False
+        return area > 0
+
+    def _wall_splits(self, pieces, groups, walls, a, span, inward, arm_keys, near):
+        """Splits on a straight wall across from a mouth: the strips run on to where the corners next to it are."""
+        k = len(groups)
+        grp = groups[a]
+        L, s0, s1 = span(a)
+        d1 = d2 = 0.0
+        prev = (a - 1) % k
+        if not walls[prev]:
+            d1 = max(0.0, (near(prev) - self._key_pos2(arm_keys[a][-1])).dot(inward(a)))
+        nxt = (a + 1) % k
+        if not walls[nxt]:
+            d2 = max(0.0, (near(nxt) - self._key_pos2(arm_keys[nxt][0])).dot(inward(nxt)))
+        ln = s1 - s0
+        if d1 + d2 > 0.9 * ln:
+            f = 0.9 * ln / (d1 + d2)
+            d1, d2 = d1 * f, d2 * f
+        pts = [s0 + d1]
+        if walls[a] == 2:
+            inner = [pieces[x].s0 for x in grp[1:]]
+            if inner:
+                turns = [(_signed_angle(self._tangent(pieces[grp[n - 1]], True), self._tangent(pieces[grp[n]], False)),
+                          pieces[grp[n]].s0) for n in range(1, len(grp))]
+                sharp = max(turns)[1]
+            else:
+                sharp = (s0 + s1) / 2.0
+            if not s0 + d1 < sharp < s1 - d2:
+                return None
+            pts.append(sharp)
+        elif walls[a] > 2:
+            return None
+        pts.append(s1 - d2)
+        # a kept vertex inside a centre wall would need more edges than the mouth across;
+        # move the split onto it, so the strip running through takes it instead
+        kept = sorted({_unwrap(L.vparam(i), s0, L.total) for i in L.anchor})
+        if len(pts) == 2:
+            mid = (pts[0] + pts[1]) / 2.0
+            inside = [q for q in kept if pts[0] + 1e-4 < q < pts[1] - 1e-4]
+            before = [q for q in inside if q <= mid]
+            after = [q for q in inside if q > mid]
+            if before:
+                pts[0] = before[-1]
+            if after:
+                pts[1] = after[0]
+        else:
+            first = [q for q in kept if pts[0] + 1e-4 < q < pts[1] - 1e-4]
+            second = [q for q in kept if pts[1] + 1e-4 < q < pts[2] - 1e-4]
+            if first:
+                pts[0] = first[-1]
+            if second:
+                pts[2] = second[0]
+        return pts
+
+    def _plus_centre(self, splits, span, arm_w):
+        """Centre sides: rungs across the arms and wall pieces between the splits, with their edge counts."""
+        k = len(splits)
+        sides = []
+        for a in range(k):
+            sides.append(("rung", a, arm_w[a]))
+            L, _, _ = span(a)
+            for x, y in zip(splits[a], splits[a][1:]):
+                sides.append(("wall", (L, x, y), None))
+        if len(sides) != 4:
+            return None
+
+        def part(L, a, b):
+            return sum(p[2] for p in self._alloc(L, a, b))
+
+        counts = [sd[2] for sd in sides]
+        # a wall across a mouth takes the mouth's count (at least one edge per piece between kept points);
+        # two walls facing each other share the larger count by angle and length
+        need = [len(self._alloc(*sd[1], anchors_only=True)) if sd[0] == "wall" else sd[2] for sd in sides]
+        for c in range(4):
+            if counts[c] is None:
+                o = (c + 2) % 4
+                counts[c] = max(part(*sides[c][1]), part(*sides[o][1])) if counts[o] is None else counts[o]
+        if counts[0] != counts[2] or counts[1] != counts[3] or any(c < nd for c, nd in zip(counts, need)):
+            return None
+        return [(sd[0], sd[1], c) for sd, c in zip(sides, counts)]
+
+    def _centre_keys(self, centre):
+        out = []
+        for kind, what, n in centre:
+            if kind == "wall":
+                L, x, y = what
+                out.append([self._add_st(L, t) for t in self._place(L, x, y, n)])
+            else:
+                out.append(("rung", what))
+        return out
 
     def _piece_keys(self, p):
         if p.kind == "mouth":
@@ -1465,7 +1699,7 @@ class RoadRemeshCore:
                 v = keep.get(key)
                 if v is None:
                     co = self._key_pos(key)
-                    if key[0] == "M" and self._strips[key[1]].cap.get(key[2]) is None:
+                    if key[0] == "Q" or key[0] == "M" and self._strips[key[1]].cap.get(key[2]) is None:
                         co = self._drape(co)
                     v = bm.verts.new(co)
                 verts[key] = v
@@ -1568,7 +1802,7 @@ class RoadRemeshCore:
             k1, k2, n = e
             rows = [arm]
             for r in range(1, n + 1):
-                left, right = k1[n - r], k2[r]
+                left, right = k1[r], k2[r]
                 pl, pr = self._key_pos(left), self._key_pos(right)
                 row = [left]
                 for j in range(1, w):
@@ -1584,7 +1818,12 @@ class RoadRemeshCore:
                     if f:
                         out.append(f)
             rungs[a] = rows[n]
-        sides = [c if isinstance(c, list) else rungs[c[1]] for c in plan["centre"]]
+        for hub, ks in plan["fans"]:
+            for i in range(0, len(ks) - 2, 2):
+                f = face([vert(hub), vert(ks[i]), vert(ks[i + 1]), vert(ks[i + 2])], mat, smooth)
+                if f:
+                    out.append(f)
+        sides =[c if isinstance(c, list) else rungs[c[1]] for c in plan["centre"]]
         fs = self._coons_sides(bm, ("P", jid), sides, vert, verts, face, mat, smooth)
         if fs is None:
             ring = []
