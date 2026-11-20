@@ -15,8 +15,29 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.geometry import barycentric_transform
 
+from .ui_help import draw_help
+
 _DENSE = 24
 _INF = float("inf")
+
+HELP = (
+    "Что делает: расставляет поперечные рёбра полосы",
+    "равномерно по плавной кривой (дуга остаётся дугой),",
+    "с учётом высот. Соседняя геометрия остаётся сварена,",
+    "UV и цвета вершин переносятся.",
+    "",
+    "Что выделить: всю полосу (грани или вершины,",
+    "концы могут быть ступенькой) или только линии",
+    "вдоль неё (Alt+клик / Ctrl+клик).",
+    "",
+    "Сегментов — сколько шагов вдоль полосы:",
+    "  больше — граней больше, меньше — реже.",
+    "Шаг — то же, но расстоянием в метрах.",
+    "Плавность — 0: по старым рёбрам, 1: по кривой.",
+    "Сохранять углы — изломы круче «Угла»",
+    "  не скругляются, на них встаёт ребро.",
+    "Концы полосы не сдвигаются. Откат — Ctrl+Z.",
+)
 
 
 def _chains_from_selection(bm):
@@ -42,10 +63,10 @@ def _chains_from_selection(bm):
             stack.extend(e.other_vert(v) for e in adj[v])
         seen |= comp
         if any(len(adj[v]) > 2 for v in comp):
-            return None, "Selected lines branch: select each line as a simple edge path"
+            return None, "Выделенные линии ветвятся: выделите полосу гранями или каждую линию отдельной цепочкой рёбер"
         ends = [v for v in comp if len(adj[v]) == 1]
         if not ends:
-            return None, "Closed loops are not supported, select open lines"
+            return None, "Замкнутые кольца пока не поддерживаются: выделите незамкнутые линии"
         order = [ends[0]]
         prev = None
         v = ends[0]
@@ -145,10 +166,10 @@ def _chains_from_region(region):
     Works with stepped ends and with triangles inside the strip."""
     loop = _boundary_loop(region)
     if loop is None:
-        return None, "Selected faces must form one strip without holes"
+        return None, "Выделенные грани должны быть одной полосой без дыр"
     ends = _strip_ends(loop)
     if ends is None:
-        return None, "Cannot find the two strip ends in the selection"
+        return None, "Не удалось найти два конца полосы: выделите полосу целиком или линии вдоль неё"
     end_a, end_b = ends
     region_edges = {e for f in region for e in f.edges}
     verts = {v for f in region for v in f.verts}
@@ -157,7 +178,7 @@ def _chains_from_region(region):
     da = _geodesic(end_a, region_edges)
     db = _geodesic(end_b, region_edges)
     if any(v not in da or v not in db for v in verts):
-        return None, "Selected faces must be connected"
+        return None, "Выделенные грани должны быть связаны"
     station = {v: da[v] / max(1e-9, da[v] + db[v]) for v in verts}
     length = sum(da[v] + db[v] for v in verts) / len(verts)
 
@@ -185,11 +206,11 @@ def _chains_from_region(region):
                 if best is None or score > best[0]:
                     best = (score, w)
             if best is None:
-                return None, "Cannot trace a line along the strip"
+                return None, "Не удалось провести линию вдоль полосы: выделите линии вручную"
             cur = best[1]
             chain.append(cur)
         if chain[-1] not in end_b_set:
-            return None, "Cannot trace a line along the strip"
+            return None, "Не удалось провести линию вдоль полосы: выделите линии вручную"
         used |= set(chain)
         chains.append(chain)
     return chains, None
@@ -318,29 +339,34 @@ def _match(params, anchored, targets):
 
 
 class MESH_OT_strip_resample(bpy.types.Operator):
-    """Evenly redistribute cross edges between selected parallel lines along a smooth curve"""
+    """Равномерно перераспределить поперечные рёбра полосы по плавной кривой (больше или меньше граней)"""
     bl_idname = "mesh.strip_resample"
     bl_label = "Strip Resample"
     bl_options = {'REGISTER', 'UNDO'}
 
     mode: EnumProperty(
-        name="Mode", default='COUNT',
+        name="Режим", default='COUNT',
         items=[
-            ('COUNT', "Count", "Set the number of segments"),
-            ('SPACING', "Spacing", "Set the distance between cross edges"),
+            ('COUNT', "Количество", "Задать, сколько сегментов будет вдоль полосы"),
+            ('SPACING', "Шаг", "Задать расстояние между поперечными рёбрами"),
         ])
-    count: IntProperty(name="Segments", default=0, min=0, max=10000,
-                       description="Number of segments along the strip (0 = keep current)")
-    spacing: FloatProperty(name="Spacing", default=2.0, min=0.01, soft_max=50.0, unit='LENGTH')
+    count: IntProperty(
+        name="Сегментов", default=0, min=0, max=10000, options={'SKIP_SAVE'},
+        description="Сколько сегментов вдоль полосы. Больше — граней больше, меньше — граней меньше. "
+                    "При запуске подставляется текущее количество")
+    spacing: FloatProperty(
+        name="Шаг", default=2.0, min=0.01, soft_max=50.0, unit='LENGTH',
+        description="Расстояние между поперечными рёбрами вдоль полосы. Меньше шаг — граней больше")
     smooth: FloatProperty(
-        name="Smoothness", description="0 = follow existing edges straight, 1 = smooth curve through the vertices",
-        default=1.0, min=0.0, max=1.0, subtype='FACTOR')
+        name="Плавность", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+        description="0 — точки идут по старым прямым рёбрам, 1 — по плавной кривой через вершины (дуга остаётся дугой)")
     keep_corners: BoolProperty(
-        name="Keep Corners", description="Do not round sharp corners: a cross edge snaps to each corner",
-        default=True)
+        name="Сохранять углы", default=True,
+        description="Острые изломы линии не скругляются: на каждый угол встаёт поперечное ребро")
     corner_angle: FloatProperty(
-        name="Corner Angle", default=math.radians(35.0), min=math.radians(1.0), max=math.radians(179.0),
-        subtype='ANGLE')
+        name="Угол", default=math.radians(35.0), min=math.radians(1.0), max=math.radians(179.0),
+        subtype='ANGLE', description="Излом круче этого угла считается острым углом")
+    show_help: BoolProperty(name="Помощь", default=False)
 
     @classmethod
     def poll(cls, context):
@@ -356,6 +382,7 @@ class MESH_OT_strip_resample(bpy.types.Operator):
         sub = row.row()
         sub.active = self.keep_corners
         sub.prop(self, "corner_angle", text="")
+        draw_help(self.layout, self, "show_help", HELP)
 
     def execute(self, context):
         obj = context.edit_object
@@ -366,7 +393,7 @@ class MESH_OT_strip_resample(bpy.types.Operator):
             self.report({'ERROR'}, str(ex))
             return {'CANCELLED'}
         bmesh.update_edit_mesh(obj.data)
-        self.report({'INFO'}, f"Strip Resample: {n_faces} faces")
+        self.report({'INFO'}, f"Strip Resample: {n_faces} граней")
         return {'FINISHED'}
 
     def _run(self, bm, obj):
@@ -378,7 +405,7 @@ class MESH_OT_strip_resample(bpy.types.Operator):
         if err:
             raise _Fail(err)
         if not chains or len(chains) < 2:
-            raise _Fail("Select the strip faces, or at least two lines along it")
+            raise _Fail("Выделите полосу (грани/вершины) или хотя бы две линии вдоль неё")
         if not region:
             chains = self._order_chains(chains)
 
@@ -386,7 +413,10 @@ class MESH_OT_strip_resample(bpy.types.Operator):
         pts = [[v.co.copy() for v in c] for c in chains]
         lengths = [_arc(p)[-1] for p in pts]
         if self.mode == 'COUNT':
-            count = self.count or old_segments
+            if self.count == 0:
+                # Show the real current number in the F9 panel, so it can be dragged up or down
+                self.count = old_segments
+            count = self.count
         else:
             unit = obj.matrix_world.to_scale()
             scale = (abs(unit.x) + abs(unit.y) + abs(unit.z)) / 3.0
@@ -478,7 +508,7 @@ class MESH_OT_strip_resample(bpy.types.Operator):
                      if all(v in pair for v in f.verts)
                      and any(v in sets[i] for v in f.verts) and any(v in sets[i + 1] for v in f.verts)]
             if not faces:
-                raise _Fail(f"No faces between line {i + 1} and line {i + 2}: select neighbouring parallel lines")
+                raise _Fail(f"Нет граней между линиями {i + 1} и {i + 2}: выделите соседние параллельные линии")
             tri_co, tri_data = [], []
             normal = Vector()
             for f in faces:
@@ -514,7 +544,7 @@ class MESH_OT_strip_resample(bpy.types.Operator):
         target_params = [k / count for k in range(1, count)]
         assign, removed = _match(params, anchored, target_params)
         if assign is None:
-            raise _Fail(f"Too few segments: a line has {sum(anchored)} vertices connected to other geometry")
+            raise _Fail(f"Слишком мало сегментов: на линии {sum(anchored)} вершин связаны с другой геометрией")
 
         for idx in sorted(removed):
             v = interior[idx]
@@ -536,7 +566,7 @@ class MESH_OT_strip_resample(bpy.types.Operator):
             for j in range(pending):
                 edge = bm.edges.get((cur, b))
                 if edge is None:
-                    raise _Fail("Line edges are broken, cannot insert vertices")
+                    raise _Fail("Рёбра линии разорваны, не удалось вставить вершины")
                 _, nv = bmesh.utils.edge_split(edge, cur, 1.0 / (pending - j + 1))
                 result.append(nv)
                 cur = nv

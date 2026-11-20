@@ -12,6 +12,20 @@ from bpy.props import BoolProperty, FloatVectorProperty, IntProperty
 from bpy_extras.view3d_utils import location_3d_to_region_2d
 from gpu_extras.batch import batch_for_shader
 
+from .ui_help import draw_help
+
+HELP = (
+    "Что делает: крупные подписи длин рёбер",
+    "в Edit Mode, вместо мелкого штатного Edge Length",
+    "(его лучше выключить в Overlays).",
+    "",
+    "Шрифт — размер текста, Знаков — после запятой.",
+    "Только выделенные — подписи у выделенных рёбер,",
+    "  иначе у всех видимых.",
+    "Без наложений — прячет налезающие подписи.",
+    "Подложка — тёмный фон под текстом.",
+)
+
 _handle = None
 
 
@@ -28,25 +42,30 @@ def _tag_redraw(self=None, context=None):
 class BigEdgeLengthPrefs(bpy.types.AddonPreferences):
     bl_idname = __package__
 
-    enabled: BoolProperty(name="Big Edge Length", default=True, update=_tag_redraw)
-    font_size: IntProperty(name="Font Size", default=18, min=6, max=96, update=_tag_redraw)
-    decimals: IntProperty(name="Decimals", default=2, min=0, max=6, update=_tag_redraw)
+    enabled: BoolProperty(name="Показывать длины", default=True, update=_tag_redraw,
+                          description="Рисовать крупные подписи длин рёбер в Edit Mode")
+    font_size: IntProperty(name="Шрифт", default=18, min=6, max=96, update=_tag_redraw,
+                           description="Размер шрифта подписей")
+    decimals: IntProperty(name="Знаков", default=2, min=0, max=6, update=_tag_redraw,
+                          description="Знаков после запятой: 8.50 m или 8.5 m")
     selected_only: BoolProperty(
-        name="Selected Only", description="Show lengths only for selected edges",
-        default=True, update=_tag_redraw)
+        name="Только выделенные", default=True, update=_tag_redraw,
+        description="Подписывать только выделенные рёбра (иначе все видимые)")
     hide_overlapping: BoolProperty(
-        name="Hide Overlapping", description="Skip labels that would overlap an already drawn one",
-        default=True, update=_tag_redraw)
+        name="Без наложений", default=True, update=_tag_redraw,
+        description="Не рисовать подписи, которые налезают на уже нарисованные")
     max_labels: IntProperty(
-        name="Max Labels", description="Skip drawing when more edges than this are visible (performance)",
-        default=3000, min=10, max=100000, update=_tag_redraw)
+        name="Максимум подписей", default=3000, min=10, max=100000, update=_tag_redraw,
+        description="Если рёбер больше — не рисовать (чтобы не тормозило)")
     color: FloatVectorProperty(
-        name="Text", subtype='COLOR', size=4, min=0.0, max=1.0,
+        name="Цвет текста", subtype='COLOR', size=4, min=0.0, max=1.0,
         default=(1.0, 0.95, 0.4, 1.0), update=_tag_redraw)
-    background: BoolProperty(name="Background", default=True, update=_tag_redraw)
+    background: BoolProperty(name="Подложка", default=True, update=_tag_redraw,
+                             description="Тёмная подложка под текстом (иначе тень)")
     bg_color: FloatVectorProperty(
-        name="Background Color", subtype='COLOR', size=4, min=0.0, max=1.0,
+        name="Цвет подложки", subtype='COLOR', size=4, min=0.0, max=1.0,
         default=(0.0, 0.0, 0.0, 0.6), update=_tag_redraw)
+    show_help: BoolProperty(name="Помощь", default=False)
 
     def draw(self, context):
         _draw_settings(self.layout, self)
@@ -72,6 +91,7 @@ def _draw_settings(layout, p):
     row.prop(p, "color", text="")
     row.prop(p, "background", text="", icon='MESH_PLANE')
     row.prop(p, "bg_color", text="")
+    draw_help(layout, p, "show_help", HELP)
 
 
 def _format_length(scene, value):

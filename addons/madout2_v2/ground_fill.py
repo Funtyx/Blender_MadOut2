@@ -11,6 +11,26 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
 from mathutils import Vector
 
+from .ui_help import draw_help
+
+HELP = (
+    "Что делает: заливает сетку граней между двумя",
+    "цепочками рёбер и вваривает её в них.",
+    "",
+    "Что выделить: две цепочки рёбер (обе открытые",
+    "или обе замкнутые — тогда получится кольцо).",
+    "",
+    "Рядов — линии между цепочками: больше — гуще.",
+    "Доп. поперёк — ещё линии поперёк по длине.",
+    "Подъём — холм (+) или яма (−) в метрах.",
+    "Профиль — форма склона, Сдвиг вершины —",
+    "  холм ближе к одной из цепочек.",
+    "Затухание у концов — подъём сходит на нет",
+    "  у открытых концов.",
+    "Материал и сглаживание — от соседней грани.",
+    "Откат — Ctrl+Z.",
+)
+
 
 def _chains_from_selection(bm):
     """Returns list of (verts, is_closed) for every connected component of selected edges."""
@@ -36,7 +56,7 @@ def _chains_from_selection(bm):
         seen |= comp
 
         if any(len(adj[v]) > 2 for v in comp):
-            return None, "Selection branches: each chain must be a simple edge path"
+            return None, "Выделение ветвится: каждая цепочка должна быть простой линией рёбер"
         ends = [v for v in comp if len(adj[v]) == 1]
         is_closed = not ends
         first = ends[0] if ends else next(iter(comp))
@@ -108,42 +128,46 @@ def _bias_t(t, bias):
 
 
 class MESH_OT_ground_fill(bpy.types.Operator):
-    """Fill between two selected edge chains with a grid surface you can bulge up or down"""
+    """Залить сетку между двумя выделенными цепочками рёбер, с рядами и подъёмом/прогибом"""
     bl_idname = "mesh.ground_fill"
     bl_label = "Ground Fill"
     bl_options = {'REGISTER', 'UNDO'}
 
     rows: IntProperty(
-        name="Rows", description="Lines between the two chains (parallel to them)",
-        default=3, min=0, max=200)
+        name="Рядов", default=3, min=0, max=200,
+        description="Сколько линий провести между цепочками (параллельно им). Больше — граней больше")
     extra_along: IntProperty(
-        name="Extra Along", description="Additional cross lines spread evenly along the length",
-        default=0, min=0, max=500)
+        name="Доп. поперёк", default=0, min=0, max=500,
+        description="Добавить поперечные линии, равномерно по длине. Больше — граней больше")
     merge_along: FloatProperty(
-        name="Merge Along", description="Cross lines closer than this (fraction of length) snap together, avoiding slivers",
-        default=0.02, min=0.0, max=0.2, subtype='FACTOR')
+        name="Слияние", default=0.02, min=0.0, max=0.2, subtype='FACTOR',
+        description="Поперечные линии ближе этой доли длины сливаются, чтобы не было тонких граней")
     bulge: FloatProperty(
-        name="Bulge", description="Push the surface up (+) or down (-) in world Z, meters",
-        default=0.0, soft_min=-20.0, soft_max=20.0, unit='LENGTH')
+        name="Подъём", default=0.0, soft_min=-20.0, soft_max=20.0, unit='LENGTH',
+        description="Поднять землю вверх (+) или прогнуть вниз (−), метры по мировой Z")
     shape: EnumProperty(
-        name="Profile", default='SMOOTH',
+        name="Профиль", default='SMOOTH',
         items=[
-            ('SMOOTH', "Smooth", "Sine hill"),
-            ('SPHERE', "Round", "Round, steep at the edges"),
-            ('LINEAR', "Linear", "Ridge"),
-            ('SHARP', "Sharp", "Narrow peak"),
-            ('FLAT', "Plateau", "Flat top with slopes at the edges"),
+            ('SMOOTH', "Плавный", "Плавный холм (синусоида)"),
+            ('SPHERE', "Круглый", "Круглый, круто у краёв"),
+            ('LINEAR', "Гребень", "Прямые склоны с острым гребнем"),
+            ('SHARP', "Острый", "Узкий пик"),
+            ('FLAT', "Плато", "Ровный верх и склоны у краёв"),
         ])
     bias: FloatProperty(
-        name="Peak Shift", description="Shift the peak toward chain A (-) or chain B (+)",
-        default=0.0, min=-1.0, max=1.0, subtype='FACTOR')
+        name="Сдвиг вершины", default=0.0, min=-1.0, max=1.0, subtype='FACTOR',
+        description="Сдвинуть вершину холма к первой цепочке (−) или ко второй (+)")
     end_taper: FloatProperty(
-        name="End Taper", description="Fade the bulge to zero near open ends (fraction of length)",
-        default=0.1, min=0.0, max=0.5, subtype='FACTOR')
-    flip: BoolProperty(name="Flip Normals", default=False)
+        name="Затухание у концов", default=0.1, min=0.0, max=0.5, subtype='FACTOR',
+        description="Плавно убрать подъём у открытых концов (доля длины)")
+    flip: BoolProperty(name="Перевернуть нормали", default=False,
+                       description="Развернуть новые грани, если они смотрят не туда")
     uv_strip: BoolProperty(
-        name="Strip UV", description="Write UV: U across, V along (active UV map)", default=True)
-    uv_scale: FloatProperty(name="UV per Meter", default=0.1, min=0.0001, soft_max=10.0)
+        name="UV полосой", default=True,
+        description="Записать UV в активный слой: U поперёк, V вдоль")
+    uv_scale: FloatProperty(name="UV на метр", default=0.1, min=0.0001, soft_max=10.0,
+                            description="Сколько единиц UV приходится на метр")
+    show_help: BoolProperty(name="Помощь", default=False)
 
     @classmethod
     def poll(cls, context):
@@ -165,6 +189,7 @@ class MESH_OT_ground_fill(bpy.types.Operator):
         sub = col.column()
         sub.enabled = self.uv_strip
         sub.prop(self, "uv_scale")
+        draw_help(self.layout, self, "show_help", HELP)
 
     def execute(self, context):
         obj = context.edit_object
@@ -177,21 +202,21 @@ class MESH_OT_ground_fill(bpy.types.Operator):
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
         if chains is None or len(chains) != 2:
-            self.report({'ERROR'}, "Select exactly two separate edge chains")
+            self.report({'ERROR'}, "Выделите ровно две отдельные цепочки рёбер")
             return {'CANCELLED'}
         (a, a_closed), (b, b_closed) = chains
         if a_closed != b_closed:
-            self.report({'ERROR'}, "Both chains must be open, or both closed")
+            self.report({'ERROR'}, "Обе цепочки должны быть открытыми или обе замкнутыми")
             return {'CANCELLED'}
         closed = a_closed
         if len(a) < 2 or len(b) < 2:
-            self.report({'ERROR'}, "Each chain needs at least one edge")
+            self.report({'ERROR'}, "В каждой цепочке нужно хотя бы одно ребро")
             return {'CANCELLED'}
         b = _align_chains(a, b, closed, mw)
 
         a, b = self._match_along(bm, a, b, closed, mw)
         if a is None:
-            self.report({'ERROR'}, "Could not match the chains")
+            self.report({'ERROR'}, "Не удалось сопоставить цепочки")
             return {'CANCELLED'}
 
         grid, faces = self._build_grid(bm, obj, a, b, closed)
@@ -207,7 +232,7 @@ class MESH_OT_ground_fill(bpy.types.Operator):
             f.select = True
         bm.select_flush_mode()
         bmesh.update_edit_mesh(me)
-        self.report({'INFO'}, f"Ground Fill: {len(faces)} faces")
+        self.report({'INFO'}, f"Ground Fill: {len(faces)} граней")
         return {'FINISHED'}
 
     def _match_along(self, bm, a, b, closed, mw):
