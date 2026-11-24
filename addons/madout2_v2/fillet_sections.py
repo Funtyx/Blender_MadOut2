@@ -41,29 +41,62 @@ HELP = (
 )
 
 
+def _hub_side(hub, region, edges):
+    """The hub, and the straight the inner side may run on along from it. A rounding that goes into
+    a straight can end its fan in a QUAD from the hub (Dima's corner: hub 8642, then a quad on to
+    8386 along the top), and that edge out of the hub is the inner side carried on, not a ray. It
+    is walked from quad to quad along the boundary, never twice through one quad - a quad's own
+    second boundary edge is the end of the rounding, which is where the walk must stop."""
+    side = [hub]
+    for start in [e for e in hub.link_edges if e in edges]:
+        quads = [f for f in start.link_faces if f in region]
+        if len(quads) != 1 or len(quads[0].verts) != 4:
+            continue  # a ray inside the fan, or the fan's own first or last triangle
+        e, used, v = start, {quads[0]}, hub
+        while True:
+            v = e.other_vert(v)
+            if v in side:
+                break
+            side.append(v)
+            nxt = None
+            for g in v.link_edges:
+                if g is e or g not in edges:
+                    continue
+                fs = [f for f in g.link_faces if f in region]
+                if len(fs) == 1 and len(fs[0].verts) == 4 and fs[0] not in used:
+                    nxt = (g, fs[0])
+                    break
+            if nxt is None:
+                break
+            e, q = nxt
+            used.add(q)
+    return side
+
+
 def _fan_chains(region):
     """
-    The hub of a fan and the rings round it, every ring ordered from one end of the rounding to the
-    other and the rings ordered outwards. Returns (hub, rings, error); hub is None when the selection
-    has no fan.
+    The hub side of a fan and the rings round it, every ring ordered from one end of the rounding
+    to the other and the rings ordered outwards. Returns (inner, rings, error): inner is the hub
+    side laid out vertex for vertex against the first ring; None when the selection has no fan.
 
-    Rings are found as layers of edge distance from the hub, not by geometry: a kerb's rings stand
-    one above the other (bottom and top of the kerb face share x and y), so anything measured in
-    the plane would merge them, while in the grid of a rounding every ring is exactly one edge
+    Rings are found as layers of edge distance from the hub side, not by geometry: a kerb's rings
+    stand one above the other (bottom and top of the kerb face share x and y), so anything measured
+    in the plane would merge them, while in the grid of a rounding every ring is exactly one edge
     further out than the one inside it.
     """
     verts = {v for f in region for v in f.verts}
     hub, best = None, 0
     for v in verts:
-        own = [f for f in v.link_faces if f in region]
-        if len(own) >= 2 and all(len(f.verts) == 3 for f in own) and len(own) > best:
-            hub, best = v, len(own)
+        tris = sum(1 for f in v.link_faces if f in region and len(f.verts) == 3)
+        if tris >= 2 and tris > best:
+            hub, best = v, tris
     if hub is None:
         return None, None, None
 
     edges = {e for f in region for e in f.edges}
-    layer = {hub: 0}
-    frontier = [hub]
+    side = _hub_side(hub, region, edges)
+    layer = {v: 0 for v in side}
+    frontier = list(side)
     while frontier:
         nxt = []
         for v in frontier:
@@ -75,7 +108,7 @@ def _fan_chains(region):
                         nxt.append(w)
         frontier = nxt
     if len(layer) != len(verts):
-        return hub, None, "Выделенные грани должны быть связаны"
+        return None, None, "Выделенные грани должны быть связаны"
 
     uneven = "Сетка скругления должна быть ровной: веер от центра и кольца квадов вокруг него"
     rings = []
@@ -89,7 +122,7 @@ def _fan_chains(region):
                 adj[b].append(a)
         ends = [v for v in ring if len(adj[v]) == 1]
         if len(ends) != 2 or any(len(n) > 2 for n in adj.values()):
-            return hub, None, f"Кольцо {k} не цепочка. {uneven}"
+            return None, None, f"Кольцо {k} не цепочка. {uneven}"
         order, prev = [ends[0]], None
         while len(order) < len(ring):
             nxt = [w for w in adj[order[-1]] if w is not prev]
@@ -98,7 +131,7 @@ def _fan_chains(region):
             prev = order[-1]
             order.append(nxt[0])
         if len(order) != len(ring):
-            return hub, None, f"Кольцо {k} не цепочка. {uneven}"
+            return None, None, f"Кольцо {k} не цепочка. {uneven}"
         rings.append(order)
 
     # The end of the rounding is a radial line: each ring starts where the ring inside it starts
@@ -113,8 +146,13 @@ def _fan_chains(region):
         if touches(rings[k][-1]):
             rings[k].reverse()
             continue
-        return hub, None, f"Концы колец {k} и {k + 1} не связаны ребром. {uneven}"
-    return hub, rings, None
+        return None, None, f"Концы колец {k} и {k + 1} не связаны ребром. {uneven}"
+    if not rings:
+        return None, None, "Вокруг центра нет ни одного кольца"
+    inner = _expand(side, rings[0], region)
+    if inner is None:
+        return None, None, f"Центр не связан с первым кольцом гранями по одной на отрезок. {uneven}"
+    return inner, rings, None
 
 
 def _welded(ring, region):
@@ -154,7 +192,11 @@ def _measure(rings, mw):
     whose chords cut furthest inside the true arc. The radius comes from the ring's length and its
     turn (n equal chords of an arc of radius R, turning by t, are 2 n R sin(t / 2n) long), so a ring
     that climbs or stands on a slope needs no plane to be fitted to it."""
-    turn = _turn([mw @ v.co for v in rings[0]])
+    # The turn is read off the LONGEST ring, the one the radius is taken from too. The innermost
+    # ring is the worst choice: where a fan ends in a quad its last chord is bent (17.7 degrees
+    # against 15 on Dima's corner) and a 90 degree rounding read as 91.
+    longest = max(rings, key=lambda r: sum(((mw @ b.co) - (mw @ a.co)).length for a, b in zip(r, r[1:])))
+    turn = _turn([mw @ v.co for v in longest])
     radius = 0.0
     for r in rings:
         p = [mw @ v.co for v in r]
@@ -296,11 +338,13 @@ def sections_by_table(turn, radius, even):
     number by default, which is the table's own last column: 34 / 4 = 8.5 gives 8, 36 / 4 = 9 gives
     10, 42 / 4 = 10.5 gives 10 - nearest even, halves going up - and every one of its nine rows
     comes out as written. Even also puts a section exactly at the middle of the rounding."""
-    # One per cent of slack. Several rows of the table sit exactly on a rounding boundary (5 m: 44 / 4
-    # = 11, even 12), and a turn measured off real chords is out by a fraction of a degree - a
-    # quarter turn read as 89.6 gave 10.95 and dropped the 5 m row to 10. At the boundary the
-    # smoother answer is taken.
-    x = segments_per_circle(radius) * turn / (2.0 * math.pi) * 1.01
+    # The turn is taken to the whole degree. Roundings are drawn at round angles and a turn read off
+    # real chords is out by a fraction of one, and several rows of the table sit exactly on a
+    # rounding boundary (5 m: 44 / 4 = 11, even 12): a quarter turn read as 89.6 dropped that row
+    # to 10. A percent of slack fixed that and was wrong the other way - 90.9 degrees at 8.5 m is
+    # 12.89, which the slack took to 13 and then to 14 where the table means 12.
+    turn = math.radians(round(math.degrees(turn)))
+    x = segments_per_circle(radius) * turn / (2.0 * math.pi) + 1e-6
     if even:
         return max(2, int(math.floor(x / 2.0 + 0.5)) * 2)
     return max(1, int(math.floor(x + 0.5)))
@@ -313,22 +357,86 @@ def rounding_faces(bm):
     return {f for f in bm.faces if f.select and len(f.verts) <= 4}
 
 
+def _expand(inner, ring, region):
+    """The inner side of a band laid out segment for segment against the ring next to it: the
+    inner vertex each ring vertex is joined to, through the face between them. Where the faces are
+    a fan the same hub comes back again and again; where a quad carries the side on (a rounding
+    that runs into a straight, its last piece a quad from the hub) it moves on. None if the two do
+    not pair up that way."""
+    inner_set = set(inner)
+    out = []
+    for k in range(len(ring) - 1):
+        f = next((g for g in ring[k].link_faces
+                  if g in region and ring[k + 1] in g.verts and any(v in inner_set for v in g.verts)), None)
+        if f is None:
+            return None
+
+        def towards(rv):
+            for e in rv.link_edges:
+                if f in e.link_faces:
+                    w = e.other_vert(rv)
+                    if w in inner_set:
+                        return w
+            return None
+
+        p, q = towards(ring[k]), towards(ring[k + 1])
+        if p is None or q is None or (out and out[-1] is not p):
+            return None
+        if not out:
+            out.append(p)
+        out.append(q)
+    return out
+
+
 def find_rings(region):
-    """(hub, rings) of a selected rounding - a fan and its rings, or a plain band of rings."""
-    hub, rings, err = _fan_chains(region)
-    if hub is None or err:
-        # No fan, or one that is not a clean grid: a band of rings is a plain strip
-        band, band_err = _chains_from_region(region)
-        if band is None or len(band) < 2:
-            raise _Fail(err or band_err or "Выделите грани скругления")
-        hub, rings = None, band
-    if not rings:
-        raise _Fail("Вокруг центра нет ни одного кольца")
-    return hub, rings
+    """(inner, rings) of a selected rounding. inner is the hub side laid out vertex for vertex
+    against the first ring - the hub repeated along a fan, moving on where a straight carries it -
+    or None for a plain band; rings run outwards from it."""
+    inner, rings, err = _fan_chains(region)
+    if inner is not None:
+        return inner, rings
+    # No clean fan: read it as a strip, whose shorter side may still be a fan with a straight on it
+    band, band_err = _chains_from_region(region)
+    if band is None or len(band) < 2:
+        raise _Fail(err or band_err or "Выделите грани скругления")
+    if len(band) >= 3 and len(band[0]) < len(band[1]):
+        inner = _expand(band[0], band[1], region)
+        if inner:
+            return inner, band[1:]
+    if len(band) >= 3 and len(band[-1]) < len(band[-2]):
+        inner = _expand(band[-1], band[-2], region)
+        if inner:
+            return inner, band[-2::-1]
+    return None, band
+
+
+def _inner_targets(inner, plan):
+    """The new inner side: the hub stays one point along every arc, and the side may leave it only
+    at the very ends of a piece - a straight run on from the hub, or a fan whose first or last
+    face is a quad (Dima's corner: five triangles round hub 8642, then a quad on to 8386, all six
+    turning the same 15 degrees). Those end points are kept where they are and the new sections in
+    between all meet the hub. A side that moves along the middle of an arc is a ring, not a hub."""
+    out = [inner[0]]
+    for first, last, straight, k in plan:
+        seg = inner[first:last + 2]
+        if all(v is seg[0] for v in seg):
+            out.extend([seg[0]] * k)
+            continue
+        middle = seg[1:-1]
+        hub = middle[0] if middle else None
+        if hub is not None and all(v is hub for v in middle):
+            # seg[0] is already in out; the k - 1 new sections inside meet the hub, the end is kept
+            out.extend([hub] * (k - 1) + [seg[-1]])
+        elif not middle and k == 1:
+            out.append(seg[-1])
+        else:
+            raise _Fail("Внутренняя сторона скругления идёт по дуге, а не из одной точки: "
+                        "выделите скругление без внутреннего края или с веером от центра")
+    return out
 
 
 class FilletSectionsCore(StripResampleCore):
-    """The strip machinery of Strip Resample (welding to the neighbours, UV, colours), with a hub."""
+    """The strip machinery of Strip Resample (welding to the neighbours, UV, colours), with a hub side."""
 
     summary = (0, 0, False, 0, [], 0)
 
@@ -372,7 +480,7 @@ class FilletSectionsCore(StripResampleCore):
         if not region:
             raise _Fail("Выделите грани скругления: веер от центра и кольца вокруг него")
 
-        hub, rings = find_rings(region)
+        inner, rings = find_rings(region)
         old, plan, found = self._plan(rings, obj.matrix_world)
         count = sum(pc[3] for pc in plan)
 
@@ -385,12 +493,13 @@ class FilletSectionsCore(StripResampleCore):
                         f"геометрией. Выделите и её или оставьте не меньше {least}")
 
         pts =[[v.co.copy() for v in r] for r in rings]
-        chains = ([[hub]] if hub else []) + rings
+        new_inner = _inner_targets(inner, plan) if inner else None
+        chains = ([inner] if inner else []) + rings
         strips = self._capture_strips(bm, chains)
         old_uv = _capture_faces(chains, strips)
-        old_pts = ([[hub.co.copy()]] if hub else []) + pts
+        old_pts = ([[v.co.copy() for v in inner]] if inner else []) + pts
         all_band = {f for s in strips for f in s["faces"]}
-        chain_edge_set = {bm.edges.get((a, b)) for r in rings for a, b in zip(r, r[1:])}
+        chain_edge_set = {bm.edges.get((a, b)) for r in chains for a, b in zip(r, r[1:]) if a is not b}
         band_edges = {e for f in all_band for e in f.edges} - chain_edge_set
         bmesh.ops.delete(bm, geom=list(all_band), context='FACES_ONLY')
         for e in band_edges:
@@ -401,7 +510,7 @@ class FilletSectionsCore(StripResampleCore):
         # angle on every ring, so the new sections run straight out from the centre, and a ring's
         # ends stay where they are - they are the seams with the straight runs either side.
         # Each arc is smoothed on its own points only, so a straight beside it is not bent into it.
-        new_chains = [[hub] * (count + 1)] if hub else []
+        new_chains = [new_inner] if inner else []
         for ring, p in zip(rings, pts):
             targets = [p[0].copy()]
             for first, last, straight, k in plan:
@@ -441,36 +550,35 @@ class FilletSectionsCore(StripResampleCore):
             f.select = True
         bm.select_flush(True)
         bm.normal_update()
-        self.summary = (old, count, hub is not None, len(rings), found, sum(1 for pc in plan if pc[2]))
+        self.summary = (old, count, inner is not None, len(rings), found, sum(1 for pc in plan if pc[2]))
         return faces
 
 
 def _capture_faces(chains, strips):
     """Per strip, the old faces in order along it, each as its corners' UVs and colours by ROLE
-    (a0, a1 on the inner chain, b0, b1 on the outer, hub for a fan) - the vertices themselves are
+    (a0, a1 on the inner chain - one and the same vertex where it is a fan's hub - b0, b1 on the
+    outer) - the vertices themselves are
     about to be moved, collapsed or split. None for a strip that is not one face per segment (a
     band with uneven sides), which keeps Strip Resample's nearest-triangle transfer."""
     out = []
     for i, s in enumerate(strips):
         A, B = chains[i], chains[i + 1]
-        fan = len(A) == 1
-        if not fan and len(A) != len(B):
+        if len(A) != len(B):
             out.append(None)
             continue
         by_verts = {frozenset(f.verts): f for f in s["faces"]}
         faces = []
         for k in range(len(B) - 1):
-            key = frozenset((A[0], B[k], B[k + 1]) if fan else (A[k], A[k + 1], B[k], B[k + 1]))
+            key = frozenset((A[k], A[k + 1], B[k], B[k + 1]))
             f = by_verts.get(key)
             if f is None:
                 faces = None
                 break
-            roles = {B[k]: "b0", B[k + 1]: "b1"}
-            roles.update({A[0]: "hub"} if fan else {A[k]: "a0", A[k + 1]: "a1"})
-            data = {roles[l.vert]: ([l[lay].uv.copy() for lay in s["uv_layers"]],
-                                    [Vector(l[lay]) for lay in s["col_layers"]]) for l in f.loops}
+            at = {l.vert: ([l[lay].uv.copy() for lay in s["uv_layers"]],
+                           [Vector(l[lay]) for lay in s["col_layers"]]) for l in f.loops}
+            data = {"a0": at[A[k]], "a1": at[A[k + 1]], "b0": at[B[k]], "b1": at[B[k + 1]]}
             faces.append(data)
-        out.append({"fan": fan, "faces": faces} if faces else None)
+        out.append({"faces": faces} if faces else None)
     return out
 
 
@@ -481,15 +589,17 @@ def _along(pts):
     return acc
 
 
-def _project(pts, acc, co):
-    """(segment, fraction, station) of the point of an old chain nearest co."""
+def _project(pts, acc, co, prefer=None):
+    """(segment, fraction, station) of the point of an old chain nearest co. A point lying on more
+    than one segment - a joint, or a hub that is every segment of a fan - goes to `prefer` if
+    that is one of them, so a corner is read off the reference face whenever it can be."""
     best = None
     for k in range(len(pts) - 1):
         a, d = pts[k], pts[k + 1] - pts[k]
         l2 = d.length_squared
         f = 0.0 if l2 < 1e-12 else max(0.0, min(1.0, (co - a).dot(d) / l2))
         dist = (a + d * f - co).length_squared
-        if best is None or dist < best[0]:
+        if best is None or dist < best[0] - 1e-12 or (k == prefer and dist <= best[0] + 1e-12):
             best = (dist, k, f)
     _, k, f = best
     return k, f, acc[k] + f * (acc[k + 1] - acc[k])
@@ -515,12 +625,9 @@ def _map_loops(face, data, pts_a, pts_b, strip, a0, a1, b0, b1):
     stays inside itself and both rings either side of an edge get the same value. What it costs:
     a texture projected flat from above sits up to that sag off (10 cm on a 9 degree step at 8 m).
     """
-    fan = data["fan"]
     olds = data["faces"]
-    nlay = len(strip["uv_layers"])
-    ncol = len(strip["col_layers"])
     acc_b = _along(pts_b)
-    acc_a = None if fan else _along(pts_a)
+    acc_a = _along(pts_a)
     mid = (b0.co + b1.co) * 0.5
     ref = _project(pts_b, acc_b, mid)[0]
 
@@ -529,18 +636,15 @@ def _map_loops(face, data, pts_a, pts_b, strip, a0, a1, b0, b1):
         lo, hi = (c0, c1) if c0 < c1 else (c1, c0)
         for c in range(lo, hi):
             f0, f1 = olds[c], olds[c + 1]
-            sides = (("b1", "b0"),) + ((("hub", "hub"),) if fan else (("a1", "a0"),))
-            for r0, r1 in sides:
+            for r0, r1 in (("b1", "b0"), ("a1", "a0")):
                 v0, v1 = f0[r0][kind][li], f1[r1][kind][li]
                 if (v0 - v1).length > 1e-4:
                     return False
         return True
 
     def value(side, co, kind, li):
-        if side == "hub":
-            return olds[ref]["hub"][kind][li].copy()
         pts, acc = (pts_a, acc_a) if side == "a" else (pts_b, acc_b)
-        c, f, st = _project(pts, acc, co)
+        c, f, st = _project(pts, acc, co, prefer=ref)
         if c != ref and not joined(ref, c, kind, li):
             # carry on in the reference face's island, measured along the chain
             span = acc[ref + 1] - acc[ref]
@@ -548,8 +652,7 @@ def _map_loops(face, data, pts_a, pts_b, strip, a0, a1, b0, b1):
         v0, v1 = olds[c][side + "0"][kind][li], olds[c][side + "1"][kind][li]
         return v0.lerp(v1, f)
 
-    side_of = {b0: "b", b1: "b"}
-    side_of.update({a0: "hub"} if fan else {a0: "a", a1: "a"})
+    side_of = {a0: "a", a1: "a", b0: "b", b1: "b"}
     for l in face.loops:
         side = side_of.get(l.vert)
         if side is None:
