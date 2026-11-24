@@ -1,7 +1,7 @@
 # =====================================================
 # Fillet Sections — меняет число сечений в скруглении: веер от
 # центральной точки и кольца вокруг него (бордюр, тротуар) делятся
-# заново на N равных шагов. Дуга остаётся дугой, концы скругления
+# заново на N равных шагов. Контур не сдвигается, концы скругления
 # и соседняя геометрия не двигаются, UV и цвета вершин переносятся.
 # Edit Mode → выделить грани скругления → вкладка MadOut2 V2.
 # =====================================================
@@ -37,6 +37,8 @@ HELP = (
     "  3 — 38 (10), 4 — 42 (10), 5 — 44 (12),",
     "  дальше +2 на круг за каждый метр.",
     "  Радиус — по внешнему кольцу скругления.",
+    "Плавность 0 — точки на старых рёбрах, контур",
+    "  не двигается; 1 — на гладкой дуге.",
     "Концы скругления не сдвигаются. Откат — Ctrl+Z.",
 )
 
@@ -786,9 +788,14 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
     even: BoolProperty(
         name="Чётное", default=True,
         description="Округлять до чётного, как в таблице: сечение встаёт ровно на середину скругления")
+    # 0 by default (Dima: "немного смещается"). On the circle through the old points the new ones
+    # stood up to 3.5 cm off the old edge on his kerb, and the plot and the road welded to that
+    # edge were bent along with it. On the old edges the outline does not move at all.
     smooth: FloatProperty(
-        name="Плавность", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
-        description="1 — новые точки на дуге через старые вершины, 0 — на старых прямых рёбрах")
+        name="Плавность", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+        description="0 — новые точки на старых рёбрах: контур скругления и соседние грани не двигаются. "
+                    "1 — на гладкой дуге через старые вершины: грубая дуга скругляется, но кромка и всё, "
+                    "что к ней приварено, сдвигаются на прогиб")
     show_help: BoolProperty(name="Помощь", default=False)
 
     # Strip Resample's corner keeping is meaningless along a rounding
