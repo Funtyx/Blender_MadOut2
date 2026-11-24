@@ -29,6 +29,11 @@ HELP = (
     "Сечений — сколько шагов вдоль дуги (0 = как сейчас).",
     "На 90° — то же, но по углу: у всех скруглений",
     "одинаковая густота, крутые получат больше.",
+    "По эталону — учитывает и угол, и радиус: выделите",
+    "образцовое скругление, задайте ему сечения и",
+    "нажмите «Взять с выделенного». Остальные получат",
+    "ту же гладкость: шире угол или больше радиус —",
+    "сечений больше, маленький радиус — меньше.",
     "Концы скругления не сдвигаются. Откат — Ctrl+Z.",
 )
 
@@ -131,36 +136,82 @@ def _turn(points):
     return d0.angle(d1) * n / (n - 1)
 
 
+def _measure(rings, mw):
+    """(turn, radius) of a rounding: how far it turns, and the radius of its OUTERMOST ring - the one
+    whose chords cut furthest inside the true arc. The radius comes from the ring's length and its
+    turn (n equal chords of an arc of radius R, turning by t, are 2 n R sin(t / 2n) long), so a ring
+    that climbs or stands on a slope needs no plane to be fitted to it."""
+    turn = _turn([mw @ v.co for v in rings[0]])
+    radius = 0.0
+    for r in rings:
+        p = [mw @ v.co for v in r]
+        n = len(p) - 1
+        length = sum((b - a).length for a, b in zip(p, p[1:]))
+        if n >= 1 and turn > 1e-6:
+            radius = max(radius, length / (2.0 * n * math.sin(turn / (2.0 * n))))
+    return turn, radius
+
+
+def sections_for(turn, radius, sag):
+    """Sections that keep every chord within `sag` of the true arc: a chord over an angle a sits
+    R (1 - cos(a / 2)) inside it. Holding that one number is what lets a single rounding set the
+    density for all of them - a wider turn gets more sections in proportion, a bigger radius more
+    as its square root, a tight one fewer."""
+    if turn <= 1e-6 or radius <= 1e-9:
+        return 1
+    step = 2.0 * math.acos(max(-1.0, min(1.0, 1.0 - sag / radius)))
+    if step <= 1e-9:
+        return 256
+    # A tenth of a percent of slack: the rounding a sag was taken from, or one turning exactly twice
+    # as far, lands on a whole number give or take rounding noise, and must not be pushed to the next
+    return max(1, min(256, math.ceil(turn / step * (1.0 - 1e-3))))
+
+
+def sag_for(turn, radius, count):
+    """The reverse of sections_for: how far the chords of `count` sections sit inside the arc."""
+    return radius * (1.0 - math.cos(turn / (2.0 * max(1, count))))
+
+
+def find_rings(region):
+    """(hub, rings) of a selected rounding - a fan and its rings, or a plain band of rings."""
+    hub, rings, err = _fan_chains(region)
+    if hub is None or err:
+        # No fan, or one that is not a clean grid: a band of rings is a plain strip
+        band, band_err = _chains_from_region(region)
+        if band is None or len(band) < 2:
+            raise _Fail(err or band_err or "Выделите грани скругления")
+        hub, rings = None, band
+    if not rings:
+        raise _Fail("Вокруг центра нет ни одного кольца")
+    return hub, rings
+
+
 class FilletSectionsCore(StripResampleCore):
     """The strip machinery of Strip Resample (welding to the neighbours, UV, colours), with a hub."""
 
-    summary = (0, 0, False, 0)
+    summary = (0, 0, False, 0, 0.0, 0.0)
+
+    def _count(self, rings, mw):
+        old = max(len(r) - 1 for r in rings)
+        turn, radius = _measure(rings, mw)
+        if self.mode == 'COUNT':
+            if self.count == 0:
+                # Show the real current number in the F9 panel, so it can be dragged up or down
+                self.count = old
+            count = self.count
+        elif self.mode == 'ANGLE':
+            count = round(self.seg_90 * math.degrees(turn) / 90.0)
+        else:
+            count = sections_for(turn, radius, self.sag)
+        return old, max(1, count), turn, radius
 
     def _run(self, bm, obj):
         region = {f for f in bm.faces if f.select}
         if not region:
             raise _Fail("Выделите грани скругления: веер от центра и кольца вокруг него")
 
-        hub, rings, err = _fan_chains(region)
-        if hub is None or err:
-            # No fan, or one that is not a clean grid: a band of rings is a plain strip
-            band, band_err = _chains_from_region(region)
-            if band is None or len(band) < 2:
-                raise _Fail(err or band_err or "Выделите грани скругления")
-            hub, rings = None, band
-        if not rings:
-            raise _Fail("Вокруг центра нет ни одного кольца")
-
-        old = max(len(r) - 1 for r in rings)
-        if self.mode == 'COUNT':
-            if self.count == 0:
-                # Show the real current number in the F9 panel, so it can be dragged up or down
-                self.count = old
-            count = self.count
-        else:
-            turn = _turn([v.co for v in rings[0]])
-            count = round(self.seg_90 * math.degrees(turn) / 90.0)
-        count = max(1, count)
+        hub, rings = find_rings(region)
+        old, count, turn, radius = self._count(rings, obj.matrix_world)
 
         # A point welded to geometry outside the selection cannot be taken out without tearing that
         # geometry, so every ring keeps at least those. Said up front, with the number, rather than
@@ -215,14 +266,14 @@ class FilletSectionsCore(StripResampleCore):
             f.select = True
         bm.select_flush(True)
         bm.normal_update()
-        self.summary = (old, count, hub is not None, len(rings))
+        self.summary = (old, count, hub is not None, len(rings), turn, radius)
         return faces
 
 
 def describe(summary):
-    old, count, fan, rings = summary
+    old, count, fan, rings, turn, radius = summary
     what = f"веер и колец: {rings}" if fan else f"колец: {rings}"
-    return f"Сечений {old} → {count} ({what})"
+    return f"Сечений {old} → {count} ({what}; {math.degrees(turn):.0f}°, R {radius:.2f} м)"
 
 
 class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
@@ -236,6 +287,9 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
         items=[
             ('COUNT', "Количество", "Задать, сколько сечений будет вдоль скругления"),
             ('ANGLE', "На 90°", "Задать густоту по углу: скругление на 90° получит столько сечений"),
+            ('SAG', "По эталону",
+             "Сечений столько, чтобы хорды отходили от дуги не больше заданного: учитывает и угол, и радиус. "
+             "Эталон снимается кнопкой «Взять с выделенного»"),
         ])
     count: IntProperty(
         name="Сечений", default=0, min=0, max=1000, options={'SKIP_SAVE'},
@@ -244,6 +298,10 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
     seg_90: IntProperty(
         name="Сечений на 90°", default=8, min=1, max=256,
         description="Сколько шагов на четверть круга; скругление на 45° получит половину")
+    sag: FloatProperty(
+        name="Отклонение от дуги", default=0.03, min=0.0005, soft_max=0.5, unit='LENGTH', precision=4,
+        description="Насколько хорда может срезать дугу на внешнем кольце. Меньше — сечений больше. "
+                    "Шире поворот — сечений больше; больше радиус — тоже больше, но плавнее")
     smooth: FloatProperty(
         name="Плавность", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
         description="1 — новые точки на дуге через старые вершины, 0 — на старых прямых рёбрах")
@@ -274,17 +332,58 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
         return {'FINISHED'}
 
 
-PARAM_KEYS = ("mode", "count", "seg_90", "smooth")
+PARAM_KEYS = ("mode", "count", "seg_90", "sag", "smooth")
 
 
 def draw_params(layout, data, prefix, count_text=None):
     col = layout.column()
     col.row().prop(data, prefix + "mode", expand=True)
-    if getattr(data, prefix + "mode") == 'COUNT':
+    mode = getattr(data, prefix + "mode")
+    if mode == 'COUNT':
         col.prop(data, prefix + "count", text=count_text) if count_text else col.prop(data, prefix + "count")
-    else:
+    elif mode == 'ANGLE':
         col.prop(data, prefix + "seg_90")
+    else:
+        col.prop(data, prefix + "sag")
     col.prop(data, prefix + "smooth")
+    if prefix:
+        # Only on the tab: the F9 panel already belongs to one applied rounding
+        col.operator(MESH_OT_fillet_sections_take.bl_idname, icon='EYEDROPPER')
+
+
+class MESH_OT_fillet_sections_take(bpy.types.Operator):
+    """Сделать выделенное скругление эталоном: столько сечений, сколько сейчас задано на вкладке
+    (или уже есть), — и дальше «По эталону» все скругления получат ту же гладкость"""
+    bl_idname = "mesh.fillet_sections_take"
+    bl_label = "Взять с выделенного"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH' and context.edit_object is not None
+
+    def execute(self, context):
+        s = context.scene.madout2_v2
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        region = {f for f in bm.faces if f.select}
+        if not region:
+            self.report({'ERROR'}, "Выделите скругление-эталон и задайте ему число сечений")
+            return {'CANCELLED'}
+        core = FilletSectionsCore()
+        for k in PARAM_KEYS:
+            setattr(core, k, getattr(s, "fs_" + k))
+        try:
+            _, rings = find_rings(region)
+            _, count, turn, radius = core._count(rings, obj.matrix_world)
+        except _Fail as ex:
+            self.report({'ERROR'}, str(ex))
+            return {'CANCELLED'}
+        s.fs_sag = sag_for(turn, radius, count)
+        s.fs_mode = 'SAG'
+        self.report({'INFO'}, f"Эталон: {count} сечений на {math.degrees(turn):.0f}° при R {radius:.2f} м — "
+                              f"хорда отходит от дуги на {s.fs_sag * 100:.1f} см")
+        return {'FINISHED'}
 
 
 def _menu(self, context):
@@ -299,6 +398,7 @@ _MENUS = (
 
 def register():
     bpy.utils.register_class(MESH_OT_fillet_sections)
+    bpy.utils.register_class(MESH_OT_fillet_sections_take)
     for m in _MENUS:
         m.append(_menu)
 
@@ -306,4 +406,5 @@ def register():
 def unregister():
     for m in _MENUS:
         m.remove(_menu)
+    bpy.utils.unregister_class(MESH_OT_fillet_sections_take)
     bpy.utils.unregister_class(MESH_OT_fillet_sections)
