@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Clean G-Curb From Selected Edges (Live Preview)",
     "author": "Dmitriy",
-    "version": (5, 26, 0),
+    "version": (5, 26, 1),
     "blender": (5, 0, 0),
     "location": "3D Viewport > N-panel > Curb",
     "description": (
@@ -2374,11 +2374,21 @@ class CURB_OT_preset_save(Operator):
         return {'FINISHED'}
 
 
-def _uv_continuous(edge, face, uv_lay, eps=1e-4):
-    """UV ребра совпадает у грани и хотя бы у одной соседней"""
+def _uv_continuous(edge, face, uv_lay, eps=1e-4, same_plane=0.9):
+    """
+    UV ребра совпадает у грани и у соседней, лежащей с ней в одной плоскости.
+
+    Это «перемычка» — стык двух плиток одной полосы бордюра. Ловушка: у
+    Г-бордюра верх и стенка развёрнуты одной полосой, и излом между ними тоже
+    UV-непрерывен. Без проверки плоскости излом (длинное ребро вдоль бордюра)
+    засчитывался перемычкой, и ширина выходила средним из 0.3 + 14.7 + 0.3 м
+    = 5.1 м, а ось UV поперёк полосы — перепутанной.
+    """
     own = {l.vert: l[uv_lay].uv for l in face.loops if l.vert in edge.verts}
     for lo in edge.link_loops:
         if lo.face is face:
+            continue
+        if lo.face.normal.dot(face.normal) < same_plane:
             continue
         other = {l.vert: l[uv_lay].uv for l in lo.face.loops if l.vert in edge.verts}
         if all((own[v] - other[v]).length < eps for v in edge.verts if v in own and v in other):
