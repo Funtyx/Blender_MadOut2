@@ -351,10 +351,42 @@ def sections_by_table(turn, radius, even):
 
 
 def rounding_faces(bm):
-    """The selected faces that can be part of a rounding. An n-gon never is - it is the plot or the
-    island the rounding runs round, selected along with it - and left in, it hides the ends of the
-    band. Left out, it is neighbouring geometry: the new points are welded into its edge."""
-    return {f for f in bm.faces if f.select and len(f.verts) <= 4}
+    """The selected faces that can be part of a rounding. An n-gon selected with it is usually the
+    plot or the island it runs round - left in, it hides the ends of the band; left out, it is
+    neighbouring geometry and the new points are welded into its edge. But a face of the band
+    itself can be an n-gon too: a kerb whose outer edge carries one extra point (Dima's 8321) is a
+    pentagon. The two are told apart by how they touch the rest: a face of the band meets its
+    neighbours across two OPPOSITE edges, the plot meets them along a run of edges in a row."""
+    sel = {f for f in bm.faces if f.select}
+    out = {f for f in sel if len(f.verts) <= 4}
+    grew = True
+    while grew:
+        grew = False
+        for f in sel - out:
+            shared = [e for e in f.edges if any(g is not f and g in out for g in e.link_faces)]
+            if len(shared) == 2 and not set(shared[0].verts) & set(shared[1].verts):
+                out.add(f)
+                grew = True
+    return out
+
+
+def _extras(chains, first_ring, region):
+    """Per ring, the points on it that no section runs through - an extra point on a kerb's edge,
+    welded to whatever lies beyond. Such a point is kept exactly where it is and the new face it
+    falls in takes it as a fifth corner; letting it take part in the sections would drag the
+    geometry outside along with it."""
+    edges = {e for f in region for e in f.edges}
+    out = []
+    for ci in range(first_ring, len(chains)):
+        near = set()
+        if ci > 0:
+            near |= set(chains[ci - 1])
+        if ci + 1 < len(chains):
+            near |= set(chains[ci + 1])
+        ring = chains[ci]
+        out.append({v for v in ring[1:-1]
+                    if not any(e in edges and e.other_vert(v) in near for e in v.link_edges)})
+    return out
 
 
 def _expand(inner, ring, region):
@@ -440,6 +472,40 @@ class FilletSectionsCore(StripResampleCore):
 
     summary = (0, 0, False, 0, [], 0)
 
+    def _rebuild_with_extras(self, bm, ring, old_pts, targets, extras, chains):
+        """The ring rebuilt on the section targets, with its extra points kept where they stand.
+        Each extra goes in between the two sections it lies between (or IS the section, if one
+        lands on it), and the ring is rebuilt piece by piece between them, so an extra is always
+        the END of a piece - the one thing Strip Resample's rebuild never moves.
+        Returns (new chain, index in it of every section)."""
+        if not extras:
+            return self._rebuild_chain(bm, ring, old_pts, targets, chains), list(range(len(targets)))
+        merged = list(targets)
+        sec = list(range(len(targets)))
+        cuts = []
+        for idx in range(1, len(ring) - 1):
+            v = ring[idx]
+            if v not in extras:
+                continue
+            co = old_pts[idx]
+            best = min(range(len(merged) - 1),
+                       key=lambda j: _point_segment(co, merged[j], merged[j + 1]))
+            near = min((best, best + 1), key=lambda j: (merged[j] - co).length)
+            if (merged[near] - co).length < 0.01 and 0 < near < len(merged) - 1:
+                merged[near] = co.copy()  # a section already falls on it: that section is it
+                cuts.append((idx, near))
+            else:
+                merged.insert(best + 1, co.copy())
+                sec = [j if j <= best else j + 1 for j in sec]
+                cuts.append((idx, best + 1))
+        cuts.sort(key=lambda c: c[1])
+        bounds = [(0, 0)] + cuts + [(len(ring) - 1, len(merged) - 1)]
+        chain = []
+        for (i0, j0), (i1, j1) in zip(bounds, bounds[1:]):
+            part = self._rebuild_chain(bm, ring[i0:i1 + 1], old_pts[i0:i1 + 1], merged[j0:j1 + 1], chains)
+            chain.extend(part if not chain else part[1:])
+        return chain, sec
+
     def _plan(self, rings, mw):
         """(old, plan): plan is [(first, last, straight, sections)] over the segments of a ring.
         A straight gets one section and nothing else - only its ends, where the arcs meet it."""
@@ -480,7 +546,12 @@ class FilletSectionsCore(StripResampleCore):
         if not region:
             raise _Fail("Выделите грани скругления: веер от центра и кольца вокруг него")
 
-        inner, rings = find_rings(region)
+        inner, rings_full = find_rings(region)
+        chains_full = ([inner] if inner else []) + rings_full
+        extras = _extras(chains_full, 1 if inner else 0, region)
+        rings = [[v for v in r if v not in ex] for r, ex in zip(rings_full, extras)]
+        if inner and extras[0]:
+            raise _Fail("Лишняя точка на первом кольце веера: так пока не умею, уберите её или выделите без веера")
         old, plan, found = self._plan(rings, obj.matrix_world)
         count = sum(pc[3] for pc in plan)
 
@@ -492,14 +563,15 @@ class FilletSectionsCore(StripResampleCore):
             raise _Fail(f"Меньше {least} сечений нельзя: {least - 1} точек кольца сварены с невыделенной "
                         f"геометрией. Выделите и её или оставьте не меньше {least}")
 
-        pts =[[v.co.copy() for v in r] for r in rings]
+        pts = [[v.co.copy() for v in r] for r in rings]
+        full_pts = [[v.co.copy() for v in r] for r in rings_full]
         new_inner = _inner_targets(inner, plan) if inner else None
         chains = ([inner] if inner else []) + rings
-        strips = self._capture_strips(bm, chains)
+        strips = self._capture_strips(bm, chains_full)
         old_uv = _capture_faces(chains, strips)
         old_pts = ([[v.co.copy() for v in inner]] if inner else []) + pts
         all_band = {f for s in strips for f in s["faces"]}
-        chain_edge_set = {bm.edges.get((a, b)) for r in chains for a, b in zip(r, r[1:]) if a is not b}
+        chain_edge_set = {bm.edges.get((a, b)) for r in chains_full for a, b in zip(r, r[1:]) if a is not b}
         band_edges = {e for f in all_band for e in f.edges} - chain_edge_set
         bmesh.ops.delete(bm, geom=list(all_band), context='FACES_ONLY')
         for e in band_edges:
@@ -511,7 +583,8 @@ class FilletSectionsCore(StripResampleCore):
         # ends stay where they are - they are the seams with the straight runs either side.
         # Each arc is smoothed on its own points only, so a straight beside it is not bent into it.
         new_chains = [new_inner] if inner else []
-        for ring, p in zip(rings, pts):
+        sections = [list(range(count + 1))] if inner else []
+        for ring, ring_full, p, pf, ex in zip(rings, rings_full, pts, full_pts, extras):
             targets = [p[0].copy()]
             for first, last, straight, k in plan:
                 part = p[first:last + 2]
@@ -519,16 +592,21 @@ class FilletSectionsCore(StripResampleCore):
                     targets.append(part[-1].copy())
                 else:
                     targets.extend(_sample(_dense_curve(part, self.smooth, set()), k)[1:])
-            new_chains.append(self._rebuild_chain(bm, ring, p, targets, chains))
+            chain, sec = self._rebuild_with_extras(bm, ring_full, pf, targets, ex, chains_full)
+            new_chains.append(chain)
+            sections.append(sec)
 
         faces = []
         for i, s in enumerate(strips):
-            a, b = new_chains[i], new_chains[i + 1]
+            A, sa = new_chains[i], sections[i]
+            B, sb = new_chains[i + 1], sections[i + 1]
             for k in range(count):
-                quad = list(dict.fromkeys([a[k], a[k + 1], b[k + 1], b[k]]))
-                if len(quad) < 3 or bm.faces.get(quad):
+                a_side = A[sa[k]:sa[k + 1] + 1]
+                b_side = B[sb[k]:sb[k + 1] + 1]
+                poly = list(dict.fromkeys(a_side + b_side[::-1]))
+                if len(poly) < 3 or bm.faces.get(poly):
                     continue
-                f = bm.faces.new(quad)
+                f = bm.faces.new(poly)
                 f.normal_update()
                 if s["normal"].length > 0 and f.normal.dot(s["normal"]) < 0:
                     f.normal_flip()
@@ -536,7 +614,7 @@ class FilletSectionsCore(StripResampleCore):
                 f.smooth = s["smooth"]
                 faces.append(f)
                 if old_uv[i] is not None:
-                    _map_loops(f, old_uv[i], old_pts[i], old_pts[i + 1], s, a[k], a[k + 1], b[k], b[k + 1])
+                    _map_loops(f, old_uv[i], old_pts[i], old_pts[i + 1], s, a_side, b_side)
                 else:
                     self._interpolate_loops(bm, f, s)
 
@@ -566,11 +644,10 @@ def _capture_faces(chains, strips):
         if len(A) != len(B):
             out.append(None)
             continue
-        by_verts = {frozenset(f.verts): f for f in s["faces"]}
         faces = []
         for k in range(len(B) - 1):
-            key = frozenset((A[k], A[k + 1], B[k], B[k + 1]))
-            f = by_verts.get(key)
+            key = {A[k], A[k + 1], B[k], B[k + 1]}
+            f = next((g for g in s["faces"] if key <= set(g.verts)), None)
             if f is None:
                 faces = None
                 break
@@ -580,6 +657,13 @@ def _capture_faces(chains, strips):
             faces.append(data)
         out.append({"faces": faces} if faces else None)
     return out
+
+
+def _point_segment(p, a, b):
+    d = b - a
+    l2 = d.length_squared
+    t = 0.0 if l2 < 1e-12 else max(0.0, min(1.0, (p - a).dot(d) / l2))
+    return (a + d * t - p).length
 
 
 def _along(pts):
@@ -605,7 +689,7 @@ def _project(pts, acc, co, prefer=None):
     return k, f, acc[k] + f * (acc[k + 1] - acc[k])
 
 
-def _map_loops(face, data, pts_a, pts_b, strip, a0, a1, b0, b1):
+def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side):
     """
     UV and colours of a new face, read off the old faces of its strip by where each corner lies
     ALONG the strip, never by which old triangle is nearest in space.
@@ -628,7 +712,7 @@ def _map_loops(face, data, pts_a, pts_b, strip, a0, a1, b0, b1):
     olds = data["faces"]
     acc_b = _along(pts_b)
     acc_a = _along(pts_a)
-    mid = (b0.co + b1.co) * 0.5
+    mid = (b_side[0].co + b_side[-1].co) * 0.5
     ref = _project(pts_b, acc_b, mid)[0]
 
     def joined(c0, c1, kind, li):
@@ -652,7 +736,8 @@ def _map_loops(face, data, pts_a, pts_b, strip, a0, a1, b0, b1):
         v0, v1 = olds[c][side + "0"][kind][li], olds[c][side + "1"][kind][li]
         return v0.lerp(v1, f)
 
-    side_of = {a0: "a", a1: "a", b0: "b", b1: "b"}
+    side_of = {v: "a" for v in a_side}
+    side_of.update({v: "b" for v in b_side})
     for l in face.loops:
         side = side_of.get(l.vert)
         if side is None:
