@@ -163,6 +163,11 @@ CIRCLE_TABLE = (
 )
 
 
+# What the last count was worked out from (turn, radius, even), so the tab can point at the row of
+# the table it used. Written by the preview and by the operator alike; display only.
+last_measure = {}
+
+
 def segments_per_circle(radius):
     t = CIRCLE_TABLE
     if radius <= t[0][0]:
@@ -218,6 +223,7 @@ class FilletSectionsCore(StripResampleCore):
             count = round(self.seg_90 * math.degrees(turn) / 90.0)
         else:
             count = sections_by_table(turn, radius, self.even)
+            last_measure.update(turn=turn, radius=radius, count=count)
         return old, max(1, count), turn, radius
 
     def _run(self, bm, obj):
@@ -359,7 +365,37 @@ def draw_params(layout, data, prefix, count_text=None):
         col.prop(data, prefix + "seg_90")
     else:
         col.prop(data, prefix + "even")
+        if prefix:
+            # Only on the tab: the table the count is read from, with the row this rounding falls on
+            _draw_table(col)
     col.prop(data, prefix + "smooth")
+
+
+def _draw_table(layout):
+    radius = last_measure.get("radius")
+    box = layout.box()
+    grid = box.column(align=True)
+    grid.scale_y = 0.75
+    head = grid.row()
+    for text in ("Радиус, м", "На круг", "На 90°"):
+        head.label(text=text)
+    rows = CIRCLE_TABLE
+    near = None
+    if radius is not None:
+        near = min(range(len(rows)), key=lambda i: abs(rows[i][0] - radius))
+    for i, (r, n) in enumerate(rows):
+        row = grid.row()
+        row.active = near is None or i == near
+        row.label(text=f"{r:g}", icon='RIGHTARROW' if i == near else 'BLANK1')
+        row.label(text=str(n))
+        row.label(text=str(sections_by_table(math.pi / 2.0, r, True)))
+    note = box.column(align=True)
+    note.scale_y = 0.8
+    note.label(text="Дальше +2 на круг за каждый метр")
+    if radius is not None:
+        turn = last_measure.get("turn", 0.0)
+        note.label(text=f"Сейчас: R {radius:.2f} м → {segments_per_circle(radius):.0f} на круг, "
+                        f"{math.degrees(turn):.0f}° → {last_measure.get('count', 0)}", icon='INFO')
 
 
 def _menu(self, context):
