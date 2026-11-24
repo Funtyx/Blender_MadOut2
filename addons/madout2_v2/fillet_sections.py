@@ -387,6 +387,8 @@ class FilletSectionsCore(StripResampleCore):
         pts =[[v.co.copy() for v in r] for r in rings]
         chains = ([[hub]] if hub else []) + rings
         strips = self._capture_strips(bm, chains)
+        old_uv = _capture_faces(chains, strips)
+        old_pts = ([[hub.co.copy()]] if hub else []) + pts
         all_band = {f for s in strips for f in s["faces"]}
         chain_edge_set = {bm.edges.get((a, b)) for r in rings for a, b in zip(r, r[1:])}
         band_edges = {e for f in all_band for e in f.edges} - chain_edge_set
@@ -424,7 +426,10 @@ class FilletSectionsCore(StripResampleCore):
                 f.material_index = s["material"]
                 f.smooth = s["smooth"]
                 faces.append(f)
-                self._interpolate_loops(bm, f, s)
+                if old_uv[i] is not None:
+                    _map_loops(f, old_uv[i], old_pts[i], old_pts[i + 1], s, a[k], a[k + 1], b[k], b[k + 1])
+                else:
+                    self._interpolate_loops(bm, f, s)
 
         for v in bm.verts:
             v.select = False
@@ -438,6 +443,121 @@ class FilletSectionsCore(StripResampleCore):
         bm.normal_update()
         self.summary = (old, count, hub is not None, len(rings), found, sum(1 for pc in plan if pc[2]))
         return faces
+
+
+def _capture_faces(chains, strips):
+    """Per strip, the old faces in order along it, each as its corners' UVs and colours by ROLE
+    (a0, a1 on the inner chain, b0, b1 on the outer, hub for a fan) - the vertices themselves are
+    about to be moved, collapsed or split. None for a strip that is not one face per segment (a
+    band with uneven sides), which keeps Strip Resample's nearest-triangle transfer."""
+    out = []
+    for i, s in enumerate(strips):
+        A, B = chains[i], chains[i + 1]
+        fan = len(A) == 1
+        if not fan and len(A) != len(B):
+            out.append(None)
+            continue
+        by_verts = {frozenset(f.verts): f for f in s["faces"]}
+        faces = []
+        for k in range(len(B) - 1):
+            key = frozenset((A[0], B[k], B[k + 1]) if fan else (A[k], A[k + 1], B[k], B[k + 1]))
+            f = by_verts.get(key)
+            if f is None:
+                faces = None
+                break
+            roles = {B[k]: "b0", B[k + 1]: "b1"}
+            roles.update({A[0]: "hub"} if fan else {A[k]: "a0", A[k + 1]: "a1"})
+            data = {roles[l.vert]: ([l[lay].uv.copy() for lay in s["uv_layers"]],
+                                    [Vector(l[lay]) for lay in s["col_layers"]]) for l in f.loops}
+            faces.append(data)
+        out.append({"fan": fan, "faces": faces} if faces else None)
+    return out
+
+
+def _along(pts):
+    acc = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        acc.append(acc[-1] + (b - a).length)
+    return acc
+
+
+def _project(pts, acc, co):
+    """(segment, fraction, station) of the point of an old chain nearest co."""
+    best = None
+    for k in range(len(pts) - 1):
+        a, d = pts[k], pts[k + 1] - pts[k]
+        l2 = d.length_squared
+        f = 0.0 if l2 < 1e-12 else max(0.0, min(1.0, (co - a).dot(d) / l2))
+        dist = (a + d * f - co).length_squared
+        if best is None or dist < best[0]:
+            best = (dist, k, f)
+    _, k, f = best
+    return k, f, acc[k] + f * (acc[k + 1] - acc[k])
+
+
+def _map_loops(face, data, pts_a, pts_b, strip, a0, a1, b0, b1):
+    """
+    UV and colours of a new face, read off the old faces of its strip by where each corner lies
+    ALONG the strip, never by which old triangle is nearest in space.
+
+    The trap the nearest-triangle transfer fell into: a kerb or a paving band is often unwrapped
+    a face at a time (each stone its own island), and a new face over the joint of two old ones
+    took two corners from one island and two from the other - torn, stretched, even turned over.
+    So one old face is the REFERENCE, the one under the new face's middle. A corner falling on
+    another old face takes that face's UV only when the unwrap runs on across every joint
+    between them; across a seam it carries on in the reference face's own island instead.
+
+    A corner's UV is read ALONG its old edge, never extrapolated across the face. Tried and taken
+    out: extending the face's map in its own plane puts a flat-projected texture exactly in place,
+    but a new point on the true arc stands outside the old chord by the chord's sag, and across a
+    30 cm kerb that pushed the UV 0.39 of a tile past the strip's edge - into the next picture of
+    an atlas. Read along the edge, the across coordinate is the old edge's own, so an atlas strip
+    stays inside itself and both rings either side of an edge get the same value. What it costs:
+    a texture projected flat from above sits up to that sag off (10 cm on a 9 degree step at 8 m).
+    """
+    fan = data["fan"]
+    olds = data["faces"]
+    nlay = len(strip["uv_layers"])
+    ncol = len(strip["col_layers"])
+    acc_b = _along(pts_b)
+    acc_a = None if fan else _along(pts_a)
+    mid = (b0.co + b1.co) * 0.5
+    ref = _project(pts_b, acc_b, mid)[0]
+
+    def joined(c0, c1, kind, li):
+        # The unwrap runs on from old face c to c + 1 when both sides of the joint agree
+        lo, hi = (c0, c1) if c0 < c1 else (c1, c0)
+        for c in range(lo, hi):
+            f0, f1 = olds[c], olds[c + 1]
+            sides = (("b1", "b0"),) + ((("hub", "hub"),) if fan else (("a1", "a0"),))
+            for r0, r1 in sides:
+                v0, v1 = f0[r0][kind][li], f1[r1][kind][li]
+                if (v0 - v1).length > 1e-4:
+                    return False
+        return True
+
+    def value(side, co, kind, li):
+        if side == "hub":
+            return olds[ref]["hub"][kind][li].copy()
+        pts, acc = (pts_a, acc_a) if side == "a" else (pts_b, acc_b)
+        c, f, st = _project(pts, acc, co)
+        if c != ref and not joined(ref, c, kind, li):
+            # carry on in the reference face's island, measured along the chain
+            span = acc[ref + 1] - acc[ref]
+            c, f = ref, ((st - acc[ref]) / span if span > 1e-9 else 0.0)
+        v0, v1 = olds[c][side + "0"][kind][li], olds[c][side + "1"][kind][li]
+        return v0.lerp(v1, f)
+
+    side_of = {b0: "b", b1: "b"}
+    side_of.update({a0: "hub"} if fan else {a0: "a", a1: "a"})
+    for l in face.loops:
+        side = side_of.get(l.vert)
+        if side is None:
+            continue
+        for li, lay in enumerate(strip["uv_layers"]):
+            l[lay].uv = value(side, l.vert.co, 0, li)
+        for li, lay in enumerate(strip["col_layers"]):
+            l[lay] = value(side, l.vert.co, 1, li)
 
 
 def describe(summary):
