@@ -165,6 +165,107 @@ def _measure(rings, mw):
     return turn, radius
 
 
+# A segment turning by less than this share of the arc's own step is a straight between two arcs
+STRAIGHT_SHARE = 0.35
+
+
+def _segment_turns(points):
+    """How far each SEGMENT of a ring turns, not each joint. On an arc every chord turns by the same
+    step; at a tangent point between an arc and a straight the JOINT turns by half a step (Dima's
+    U-turn: 18, 18, 9, 9, 18 degrees), so reading joints a straight looks like two half-turns and
+    nothing more. A joint's turn is the mean of its two segments', t_i = (s_i + s_(i+1)) / 2, which
+    fixes every s but one free number c that enters with alternating sign; c is the median of what
+    each pair of neighbouring segments says it should be, so a straight or two cannot drag it."""
+    n = len(points) - 1
+    if n < 2:
+        return None
+    normal = Vector()
+    for i in range(1, n):
+        normal += (points[i] - points[0]).cross(points[i + 1] - points[0])
+    t = []
+    for a, b, c in zip(points, points[1:], points[2:]):
+        d0, d1 = b - a, c - b
+        ang = d0.angle(d1) if d0.length > 1e-9 and d1.length > 1e-9 else 0.0
+        if normal.length > 1e-12 and d0.cross(d1).dot(normal) < 0.0:
+            ang = -ang
+        t.append(ang)
+    a = [0.0]
+    for i in range(n - 1):
+        a.append(2.0 * t[i] - a[i])
+    guesses = sorted((a[i + 1] - a[i]) / 2.0 * (1.0 if i % 2 == 0 else -1.0) for i in range(n - 1))
+    c = guesses[len(guesses) // 2]
+    return [a[j] + (c if j % 2 == 0 else -c) for j in range(n)]
+
+
+def _pieces(rings, mw, keep_straight):
+    """The rounding cut into arcs and the straights between them: [(first, last, straight), ...] as
+    segment indices, the same on every ring. A straight is so on average over the rings, measured
+    against each ring's own arc step. None when it is all one arc (or the rings do not pair up
+    segment for segment, which is the only way the pieces could be read off them)."""
+    counts = {len(r) for r in rings}
+    if not keep_straight or len(counts) != 1 or len(rings[0]) < 4:
+        return None
+    n = len(rings[0]) - 1
+    shares = [0.0] * n
+    used = 0
+    for r in rings:
+        st = _segment_turns([mw @ v.co for v in r])
+        if st is None:
+            continue
+        mags = sorted(abs(x) for x in st)
+        step = mags[(3 * len(mags)) // 4]
+        if step < math.radians(1.0):
+            continue
+        for j in range(n):
+            shares[j] += abs(st[j]) / step
+        used += 1
+    if not used:
+        return None
+    straight = [shares[j] / used < STRAIGHT_SHARE for j in range(n)]
+    if not any(straight) or all(straight):
+        return None
+    pieces = []
+    start = 0
+    for j in range(1, n + 1):
+        if j == n or straight[j] != straight[start]:
+            pieces.append((start, j - 1, straight[start]))
+            start = j
+    return pieces
+
+
+def _arc_of(rings, mw, first, last):
+    """(turn, radius) of one arc piece: turn summed over its segments on the longest ring, radius
+    the largest of the rings' - chords of angle s on a circle of radius R are 2 R sin(s / 2) long."""
+    best = (0.0, 0.0, 0.0)
+    radius = 0.0
+    for r in rings:
+        p = [mw @ v.co for v in r]
+        st = _segment_turns(p)
+        seg = range(first, last + 1)
+        length = sum((p[j + 1] - p[j]).length for j in seg)
+        turn = abs(sum(st[j] for j in seg))
+        chord = sum(2.0 * math.sin(abs(st[j]) / 2.0) for j in seg)
+        if chord > 1e-9:
+            radius = max(radius, length / chord)
+        if length > best[0]:
+            best = (length, turn, 0.0)
+    return best[1], radius
+
+
+def _share(total, weights):
+    """total split over the weights, every share at least 1, largest remainders first."""
+    k = len(weights)
+    if total <= k:
+        return [1] * k
+    w = sum(weights) or float(k)
+    raw = [max(0.0, x) / w * (total - k) for x in weights]
+    out = [1 + int(x) for x in raw]
+    left = total - sum(out)
+    for i in sorted(range(k), key=lambda i: raw[i] - int(raw[i]), reverse=True)[:left]:
+        out[i] += 1
+    return out
+
+
 # Segments on a FULL circle for a rounding of this radius - the studio's table. Between its rows the
 # count is read off the straight line between them; past the last row it carries on at the last
 # row's rate (2 more per metre), below the first it stays at the first.
@@ -195,9 +296,11 @@ def sections_by_table(turn, radius, even):
     number by default, which is the table's own last column: 34 / 4 = 8.5 gives 8, 36 / 4 = 9 gives
     10, 42 / 4 = 10.5 gives 10 - nearest even, halves going up - and every one of its nine rows
     comes out as written. Even also puts a section exactly at the middle of the rounding."""
-    # The slack is for a quarter turn read back as 10.9999999 sections instead of 11, which would
-    # round to 10 and break the table's own 5 m row
-    x = segments_per_circle(radius) * turn / (2.0 * math.pi) + 1e-6
+    # One per cent of slack. Several rows of the table sit exactly on a rounding boundary (5 m: 44 / 4
+    # = 11, even 12), and a turn measured off real chords is out by a fraction of a degree - a
+    # quarter turn read as 89.6 gave 10.95 and dropped the 5 m row to 10. At the boundary the
+    # smoother answer is taken.
+    x = segments_per_circle(radius) * turn / (2.0 * math.pi) * 1.01
     if even:
         return max(2, int(math.floor(x / 2.0 + 0.5)) * 2)
     return max(1, int(math.floor(x + 0.5)))
@@ -227,22 +330,42 @@ def find_rings(region):
 class FilletSectionsCore(StripResampleCore):
     """The strip machinery of Strip Resample (welding to the neighbours, UV, colours), with a hub."""
 
-    summary = (0, 0, False, 0, 0.0, 0.0)
+    summary = (0, 0, False, 0, [], 0)
 
-    def _count(self, rings, mw):
+    def _plan(self, rings, mw):
+        """(old, plan): plan is [(first, last, straight, sections)] over the segments of a ring.
+        A straight gets one section and nothing else - only its ends, where the arcs meet it."""
         old = max(len(r) - 1 for r in rings)
-        turn, radius = _measure(rings, mw)
+        n = len(rings[0]) - 1
+        pieces = _pieces(rings, mw, self.keep_straight) or [(0, n, False)]
+        arcs = [i for i, pc in enumerate(pieces) if not pc[2]]
+        measured = {}
+        for i in arcs:
+            if len(pieces) == 1:
+                measured[i] = _measure(rings, mw)
+            else:
+                measured[i] = _arc_of(rings, mw, pieces[i][0], pieces[i][1])
+        counts = {i: 1 for i in range(len(pieces))}
         if self.mode == 'COUNT':
             if self.count == 0:
                 # Show the real current number in the F9 panel, so it can be dragged up or down
                 self.count = old
-            count = self.count
+            straights = len(pieces) - len(arcs)
+            for i, k in zip(arcs, _share(max(len(arcs), self.count - straights),
+                                         [measured[i][0] for i in arcs])):
+                counts[i] = k
         elif self.mode == 'ANGLE':
-            count = round(self.seg_90 * math.degrees(turn) / 90.0)
+            for i in arcs:
+                counts[i] = max(1, round(self.seg_90 * math.degrees(measured[i][0]) / 90.0))
         else:
-            count = sections_by_table(turn, radius, self.even)
-            last_measure.update(turn=turn, radius=radius, count=count)
-        return old, max(1, count), turn, radius
+            for i in arcs:
+                counts[i] = sections_by_table(measured[i][0], measured[i][1], self.even)
+        plan = [(pc[0], pc[1], pc[2], counts[i]) for i, pc in enumerate(pieces)]
+        found = [(measured[i][0], measured[i][1], counts[i]) for i in arcs]
+        if self.mode == 'TABLE':
+            last_measure.clear()
+            last_measure.update(arcs=found, straights=len(pieces) - len(arcs))
+        return old, plan, found
 
     def _run(self, bm, obj):
         region = rounding_faces(bm)
@@ -250,7 +373,8 @@ class FilletSectionsCore(StripResampleCore):
             raise _Fail("Выделите грани скругления: веер от центра и кольца вокруг него")
 
         hub, rings = find_rings(region)
-        old, count, turn, radius = self._count(rings, obj.matrix_world)
+        old, plan, found = self._plan(rings, obj.matrix_world)
+        count = sum(pc[3] for pc in plan)
 
         # A point welded to geometry outside the selection cannot be taken out without tearing that
         # geometry, so every ring keeps at least those. Said up front, with the number, rather than
@@ -274,9 +398,16 @@ class FilletSectionsCore(StripResampleCore):
         # Every ring is walked at equal steps of its OWN length. On concentric arcs that is the same
         # angle on every ring, so the new sections run straight out from the centre, and a ring's
         # ends stay where they are - they are the seams with the straight runs either side.
+        # Each arc is smoothed on its own points only, so a straight beside it is not bent into it.
         new_chains = [[hub] * (count + 1)] if hub else []
         for ring, p in zip(rings, pts):
-            targets = _sample(_dense_curve(p, self.smooth, set()), count)
+            targets = [p[0].copy()]
+            for first, last, straight, k in plan:
+                part = p[first:last + 2]
+                if straight:
+                    targets.append(part[-1].copy())
+                else:
+                    targets.extend(_sample(_dense_curve(part, self.smooth, set()), k)[1:])
             new_chains.append(self._rebuild_chain(bm, ring, p, targets, chains))
 
         faces = []
@@ -305,14 +436,17 @@ class FilletSectionsCore(StripResampleCore):
             f.select = True
         bm.select_flush(True)
         bm.normal_update()
-        self.summary = (old, count, hub is not None, len(rings), turn, radius)
+        self.summary = (old, count, hub is not None, len(rings), found, sum(1 for pc in plan if pc[2]))
         return faces
 
 
 def describe(summary):
-    old, count, fan, rings, turn, radius = summary
+    old, count, fan, rings, arcs, straights = summary
     what = f"веер и колец: {rings}" if fan else f"колец: {rings}"
-    return f"Сечений {old} → {count} ({what}; {math.degrees(turn):.0f}°, R {radius:.2f} м)"
+    parts = ", ".join(f"{math.degrees(t):.0f}° R {r:.2f} м → {k}" for t, r, k in arcs)
+    if straights:
+        parts += f"; прямых без сечений: {straights}"
+    return f"Сечений {old} → {count} ({what}; {parts})"
 
 
 class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
@@ -337,6 +471,10 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
     seg_90: IntProperty(
         name="Сечений на 90°", default=8, min=1, max=256,
         description="Сколько шагов на четверть круга; скругление на 45° получит половину")
+    keep_straight: BoolProperty(
+        name="Прямые без сечений", default=True,
+        description="Прямые участки между дугами (разворот, скругление с прямой вставкой) остаются одним "
+                    "отрезком; сечения ставятся только на дуги, каждой — по её радиусу и углу")
     even: BoolProperty(
         name="Чётное", default=True,
         description="Округлять до чётного, как в таблице: сечение встаёт ровно на середину скругления")
@@ -370,7 +508,7 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
         return {'FINISHED'}
 
 
-PARAM_KEYS = ("mode", "count", "seg_90", "even", "smooth")
+PARAM_KEYS = ("mode", "count", "seg_90", "even", "keep_straight", "smooth")
 
 
 def draw_params(layout, data, prefix, count_text=None):
@@ -386,11 +524,13 @@ def draw_params(layout, data, prefix, count_text=None):
         if prefix:
             # Only on the tab: the table the count is read from, with the row this rounding falls on
             _draw_table(col)
+    col.prop(data, prefix + "keep_straight")
     col.prop(data, prefix + "smooth")
 
 
 def _draw_table(layout):
-    radius = last_measure.get("radius")
+    arcs = last_measure.get("arcs") or []
+    radius = arcs[0][1] if arcs else None
     box = layout.box()
     grid = box.column(align=True)
     grid.scale_y = 0.75
@@ -400,20 +540,24 @@ def _draw_table(layout):
     rows = CIRCLE_TABLE
     near = None
     if radius is not None:
-        near = min(range(len(rows)), key=lambda i: abs(rows[i][0] - radius))
+        near = min(range(len(rows)), key=lambda i: min(abs(rows[i][0] - a[1]) for a in arcs))
     for i, (r, n) in enumerate(rows):
         row = grid.row()
-        row.active = near is None or i == near
-        row.label(text=f"{r:g}", icon='RIGHTARROW' if i == near else 'BLANK1')
+        hit = radius is not None and any(
+            min(range(len(rows)), key=lambda k: abs(rows[k][0] - a[1])) == i for a in arcs)
+        row.active = near is None or hit
+        row.label(text=f"{r:g}", icon='RIGHTARROW' if hit else 'BLANK1')
         row.label(text=str(n))
         row.label(text=str(sections_by_table(math.pi / 2.0, r, True)))
     note = box.column(align=True)
     note.scale_y = 0.8
     note.label(text="Дальше +2 на круг за каждый метр")
-    if radius is not None:
-        turn = last_measure.get("turn", 0.0)
-        note.label(text=f"Сейчас: R {radius:.2f} м → {segments_per_circle(radius):.0f} на круг, "
-                        f"{math.degrees(turn):.0f}° → {last_measure.get('count', 0)}", icon='INFO')
+    for i, (turn, r, k) in enumerate(arcs):
+        name = "Сейчас" if len(arcs) == 1 else f"Дуга {i + 1}"
+        note.label(text=f"{name}: R {r:.2f} м → {segments_per_circle(r):.0f} на круг, "
+                        f"{math.degrees(turn):.0f}° → {k}", icon='INFO' if i == 0 else 'BLANK1')
+    if last_measure.get("straights"):
+        note.label(text=f"Прямых без сечений: {last_measure['straights']}", icon='BLANK1')
 
 
 def _menu(self, context):
