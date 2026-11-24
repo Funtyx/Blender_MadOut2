@@ -11,6 +11,7 @@ import math
 import bmesh
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
+from mathutils import Vector
 
 from .strip_resample import (StripResampleCore, _Fail, _arc, _chains_from_region, _dense_curve,
                              _sample)
@@ -126,16 +127,26 @@ def _welded(ring, region):
 
 
 def _turn(points):
-    """How far the rounding turns. The first and last CHORDS of n equal chords of an arc differ by
-    only (n - 1) / n of the arc's turn - half a step lost at each end - so the angle between them
-    is scaled back up; read raw, 45 degrees in five pieces measured 36."""
+    """How far the rounding turns: the turns between neighbouring chords added up, signed against the
+    ring's own plane, so a U-turn and a loop past 180 degrees read true (the angle between the first
+    and last chord alone tops out at 180). Chords of an arc turn by (n - 1) / n of it - half a step
+    is lost at each end - so the sum is scaled back up; read raw, 45 degrees in five pieces was 36."""
     n = len(points) - 1
     if n < 2:
         return 0.0
-    d0, d1 = points[1] - points[0], points[-1] - points[-2]
-    if d0.length < 1e-9 or d1.length < 1e-9:
-        return 0.0
-    return d0.angle(d1) * n / (n - 1)
+    normal = Vector()
+    for i in range(1, n):
+        normal += (points[i] - points[0]).cross(points[i + 1] - points[0])
+    total = 0.0
+    for a, b, c in zip(points, points[1:], points[2:]):
+        d0, d1 = b - a, c - b
+        if d0.length < 1e-9 or d1.length < 1e-9:
+            continue
+        ang = d0.angle(d1)
+        if normal.length > 1e-12 and d0.cross(d1).dot(normal) < 0.0:
+            ang = -ang
+        total += ang
+    return abs(total) * n / (n - 1)
 
 
 def _measure(rings, mw):
@@ -192,6 +203,13 @@ def sections_by_table(turn, radius, even):
     return max(1, int(math.floor(x + 0.5)))
 
 
+def rounding_faces(bm):
+    """The selected faces that can be part of a rounding. An n-gon never is - it is the plot or the
+    island the rounding runs round, selected along with it - and left in, it hides the ends of the
+    band. Left out, it is neighbouring geometry: the new points are welded into its edge."""
+    return {f for f in bm.faces if f.select and len(f.verts) <= 4}
+
+
 def find_rings(region):
     """(hub, rings) of a selected rounding - a fan and its rings, or a plain band of rings."""
     hub, rings, err = _fan_chains(region)
@@ -227,7 +245,7 @@ class FilletSectionsCore(StripResampleCore):
         return old, max(1, count), turn, radius
 
     def _run(self, bm, obj):
-        region = {f for f in bm.faces if f.select}
+        region = rounding_faces(bm)
         if not region:
             raise _Fail("Выделите грани скругления: веер от центра и кольца вокруг него")
 
