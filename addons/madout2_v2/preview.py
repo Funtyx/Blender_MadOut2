@@ -10,7 +10,7 @@ import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
 
-from . import ground_fill, road_remesh, stairs, strip_resample
+from . import fillet_sections, ground_fill, road_remesh, stairs, strip_resample
 
 from mathutils import Vector
 
@@ -24,6 +24,7 @@ _handle = None
 
 _TOOLS = {
     'SR': (strip_resample.StripResampleCore, strip_resample.PARAM_KEYS, "sr_", strip_resample._Fail),
+    'FS': (fillet_sections.FilletSectionsCore, fillet_sections.PARAM_KEYS, "fs_", fillet_sections._Fail),
     'GF': (ground_fill.GroundFillCore, ground_fill.PARAM_KEYS, "gf_", ground_fill._Fail),
     'ST': (stairs.StairsCore, stairs.PARAM_KEYS, "st_", stairs._Fail),
     'RR': (road_remesh.RoadRemeshCore, road_remesh.PARAM_KEYS, "rr_", road_remesh._Fail),
@@ -33,6 +34,8 @@ _TOOLS = {
 def active_tool(s):
     if s.preview_sr:
         return 'SR'
+    if s.preview_fs:
+        return 'FS'
     if s.preview_rr:
         return 'RR'
     if s.preview_gf:
@@ -104,6 +107,8 @@ def _compute(obj, tool, s):
             return [], _surface(faces, mw, False), "", stairs.describe(core.summary)
         if tool == 'RR':
             info = road_remesh.describe(core.summary) + f", {len(faces)} граней"
+        if tool == 'FS':
+            info = fillet_sections.describe(core.summary) + f", {len(faces)} граней"
         edges = {e for f in faces for e in f.edges}
         lines = []
         for e in edges:
