@@ -4,10 +4,26 @@
   "data": [
     {
       "schema_version": "1.0.0",
+      "id": "madout2_v2",
+      "name": "MadOut2 V2",
+      "tagline": "\u0414\u043e\u0440\u043e\u0433\u0438, \u0440\u0435\u043b\u044c\u0435\u0444, \u043b\u0435\u0441\u0442\u043d\u0438\u0446\u044b \u0438 \u0434\u043b\u0438\u043d\u044b \u0440\u0451\u0431\u0435\u0440 \u0434\u043b\u044f MadOut2",
+      "version": "1.4.0",
+      "type": "add-on",
+      "maintainer": "Funtyx",
+      "license": [
+        "SPDX:GPL-3.0-or-later"
+      ],
+      "blender_version_min": "5.1.0",
+      "archive_url": "./madout2_v2-1.4.0.zip",
+      "archive_size": 64242,
+      "archive_hash": "sha256:30e540fac0ac822982f1f4f1eaa7ef5bcbe71e3671618b842db73dfb5abd1b77"
+    },
+    {
+      "schema_version": "1.0.0",
       "id": "madout2_tools",
       "name": "MadOut2 Tools",
       "tagline": "\u0412\u0441\u0435 Blender-\u0438\u043d\u0441\u0442\u0440\u0443\u043c\u0435\u043d\u0442\u044b MadOut2 \u043d\u0430 \u043e\u0434\u043d\u043e\u0439 \u0432\u043a\u043b\u0430\u0434\u043a\u0435",
-      "version": "1.0.9",
+      "version": "1.0.10",
       "type": "add-on",
       "maintainer": "Funtyx",
       "license": [
@@ -17,25 +33,9 @@
       "permissions": {
         "files": "\u042d\u043a\u0441\u043f\u043e\u0440\u0442 FBX, PNG, \u043c\u0430\u0442\u0435\u0440\u0438\u0430\u043b\u043e\u0432 \u0438 \u043f\u0440\u0435\u0444\u0430\u0431\u043e\u0432 Unity"
       },
-      "archive_url": "./madout2_tools-1.0.9.zip",
-      "archive_size": 161801,
-      "archive_hash": "sha256:9434f968c237c934fe949dc2fbbdfe34d67c5dd17580a1f28e3329ce085084d5"
-    },
-    {
-      "schema_version": "1.0.0",
-      "id": "madout2_v2",
-      "name": "MadOut2 V2",
-      "tagline": "\u0414\u043e\u0440\u043e\u0433\u0438, \u0440\u0435\u043b\u044c\u0435\u0444, \u043b\u0435\u0441\u0442\u043d\u0438\u0446\u044b \u0438 \u0434\u043b\u0438\u043d\u044b \u0440\u0451\u0431\u0435\u0440 \u0434\u043b\u044f MadOut2",
-      "version": "1.3.2",
-      "type": "add-on",
-      "maintainer": "Funtyx",
-      "license": [
-        "SPDX:GPL-3.0-or-later"
-      ],
-      "blender_version_min": "5.1.0",
-      "archive_url": "./madout2_v2-1.3.2.zip",
-      "archive_size": 58999,
-      "archive_hash": "sha256:73fe38f21e6d7fb257a68e5f3ee7478f690d69dfd1a39cf7dbcd52c396c89124"
+      "archive_url": "./madout2_tools-1.0.10.zip",
+      "archive_size": 162003,
+      "archive_hash": "sha256:4ebf0b12377639e314220f22876c7e2516e74ed0cc21d5aea0a01921315acd44"
     }
   ]
 }
