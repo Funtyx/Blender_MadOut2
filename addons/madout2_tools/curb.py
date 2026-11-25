@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Clean G-Curb From Selected Edges (Live Preview)",
     "author": "Dmitriy",
-    "version": (5, 27, 0),
+    "version": (5, 28, 0),
     "blender": (5, 0, 0),
     "location": "3D Viewport > N-panel > Curb",
     "description": (
@@ -3127,9 +3127,14 @@ class CURB_OT_bake_and_merge(Operator):
 
         cut_note = ""
 
+        # A flat strip (a road line, a band of paving) is cut INTO the ground instead: nothing to
+        # bridge afterwards, its outline is welded where the ground was re-cut along it
+        inlay = (settings.close_free_side and settings.build_mode == 'CURB'
+                 and src_obj.mode == 'EDIT' and _flat_strip(curb_obj))
+
         # габариты бордюра — по ним потом найдём его свободную сторону
         gap_box = None
-        if settings.close_free_side and curb_obj.data.vertices:
+        if settings.close_free_side and not inlay and curb_obj.data.vertices:
             cos = [curb_obj.matrix_world @ v.co for v in curb_obj.data.vertices]
             mn = Vector((min(c.x for c in cos), min(c.y for c in cos), min(c.z for c in cos)))
             mx = Vector((max(c.x for c in cos), max(c.y for c in cos), max(c.z for c in cos)))
@@ -3148,7 +3153,26 @@ class CURB_OT_bake_and_merge(Operator):
         try:
             # Грани под бордюром удаляем ДО join — иначе он ляжет вторым слоем.
             # Делается после снятия хендлеров, иначе смена режима убьёт превью.
-            if settings.close_free_side and _footprint:
+            if inlay:
+                try:
+                    res = _inlay(src_obj, curb_obj)
+                    if isinstance(res, str):
+                        cut_note = f", не вшито: {res}"
+                    else:
+                        replaced, made, pieces = res
+                        # the strip is in the mesh now, laid by the inlay itself
+                        cleanup_preview_object()
+                        mesh = bpy.data.meshes.get("Curb_PreviewMesh")
+                        if mesh and mesh.users == 0:
+                            bpy.data.meshes.remove(mesh)
+                        self.report({'INFO'}, f"Вшито в землю: {replaced} граней земли → {made} "
+                                              f"(из них полоса: {pieces})")
+                        return {'FINISHED'}
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    cut_note = ", вшить не удалось (см. консоль)"
+            elif settings.close_free_side and _footprint:
                 try:
                     killed = _cut_under(src_obj, list(_footprint))
                     if killed:
@@ -3310,6 +3334,363 @@ def _slice_along(bm, mw, stamps, up):
                 continue
             cuts += _knife_segment(bm, mw, a2, b2, st["zmin"], st["zmax"])
     return cuts
+
+
+def _flat_strip(curb_obj):
+    """A strip lying flat (a road line, a band of paving): every face of it faces up or down."""
+    me = curb_obj.data
+    if not me.polygons:
+        return False
+    nm = curb_obj.matrix_world.to_3x3()
+    return all(abs((nm @ p.normal).normalized().z) >= 0.9 for p in me.polygons)
+
+
+def _inlay(src_obj, curb_obj):
+    """Lay a flat strip INTO the ground under it, the way a joint is cut into paving.
+
+    The ground faces the strip lies on are re-cut along the strip's outline by Blender's own
+    constrained triangulation of the plan (the output type that keeps every input face whole where
+    nothing crosses it). Each piece outside the strip keeps its face's material, height, UV and
+    colour, read off that face; the pieces under the strip go; and the strip's vertices are put
+    on the ground's height, so Merge by Distance welds the two all along the outline.
+
+    The old way - knife each footprint segment, delete faces whose centre is under the strip,
+    bridge the free side - cut only where one segment crossed exactly two edges of one face. A road
+    line runs along long faces, so almost nothing was cut: on Dima's 103 m line it left the ground
+    under the strip, 103 m of open edge beside it and a fan of triangles across the corner.
+
+    Returns (ground faces replaced, faces made, {strip vertex index: height}) or a note string."""
+    from mathutils.geometry import delaunay_2d_cdt, intersect_point_tri_2d, barycentric_transform
+
+    mw = src_obj.matrix_world
+    inv = mw.inverted()
+    nm = mw.to_3x3()
+    cw = curb_obj.matrix_world
+    me = curb_obj.data
+
+    strip_v = [cw @ v.co for v in me.vertices]
+    lo = Vector((min(q.x for q in strip_v), min(q.y for q in strip_v)))
+    hi = Vector((max(q.x for q in strip_v), max(q.y for q in strip_v)))
+    zlo = min(q.z for q in strip_v) - 0.25
+    zhi = max(q.z for q in strip_v) + 0.25
+    # The plan is solved about the strip's middle: world coordinates in the thousands of metres
+    # leave a float32 Vector a quarter of a millimetre to work with.
+    origin = (lo + hi) * 0.5
+
+    def P(v3):
+        return Vector((v3.x - origin.x, v3.y - origin.y))
+
+    def area2(pts):
+        return sum(pts[i].x * pts[(i + 1) % len(pts)].y - pts[(i + 1) % len(pts)].x * pts[i].y
+                   for i in range(len(pts)))
+
+    def strictly_inside(pt, poly, eps=1e-4):
+        n = len(poly)
+        for i in range(n):
+            a, b = poly[i], poly[(i + 1) % n]
+            ab = b - a
+            if ab.length_squared < 1e-18:
+                continue
+            t = max(0.0, min(1.0, (pt - a).dot(ab) / ab.length_squared))
+            if (a + ab * t - pt).length < eps:
+                return False
+        c = False
+        for i in range(n):
+            a, b = poly[i], poly[(i + 1) % n]
+            if (a.y > pt.y) != (b.y > pt.y):
+                if pt.x < a.x + (pt.y - a.y) / (b.y - a.y) * (b.x - a.x):
+                    c = not c
+        return c
+
+    def crosses(p1, p2, q1, q2, eps=1e-6):
+        r, sv = p2 - p1, q2 - q1
+        den = r.x * sv.y - r.y * sv.x
+        if abs(den) < 1e-14:
+            return False
+        w = q1 - p1
+        t = (w.x * sv.y - w.y * sv.x) / den
+        u = (w.x * r.y - w.y * r.x) / den
+        return eps < t < 1 - eps and eps < u < 1 - eps
+
+    strip_polys = [[P(strip_v[i]) for i in p.vertices] for p in me.polygons]
+    strip_planes = [(cw @ p.center, (cw.to_3x3() @ p.normal).normalized()) for p in me.polygons]
+
+    def plane_z(origin3, n, pt2):
+        if abs(n.z) < 1e-6:
+            return origin3.z
+        x, y = pt2.x + origin.x, pt2.y + origin.y
+        return origin3.z - (n.x * (x - origin3.x) + n.y * (y - origin3.y)) / n.z
+
+    def common_points(poly, sp):
+        """plan points the ground face and a strip face have in common, if they share an area"""
+        pts = [q for q in sp if strictly_inside(q, poly)] + [q for q in poly if strictly_inside(q, sp)]
+        for i in range(len(poly)):
+            for j in range(len(sp)):
+                a, b, c, d = poly[i], poly[(i + 1) % len(poly)], sp[j], sp[(j + 1) % len(sp)]
+                if crosses(a, b, c, d):
+                    r, sv = b - a, d - c
+                    den = r.x * sv.y - r.y * sv.x
+                    w = c - a
+                    t = (w.x * sv.y - w.y * sv.x) / den
+                    pts.append(a + r * t)
+        mid = sum(sp, Vector((0.0, 0.0))) / len(sp)
+        if strictly_inside(mid, poly):
+            pts.append(mid)
+        return pts
+
+    def ground_z(f, q):
+        """the face's height at plan point q, over its own triangles: a big n-gon of a road
+        is not flat - one here runs 1.5 m from end to end - so its plane says nothing"""
+        best = None
+        for t in face_tris(f):
+            a, b, c = (P(mw @ l.vert.co) for l in t)
+            if intersect_point_tri_2d(q, a, b, c):
+                best = t
+                break
+        if best is None:
+            return None
+        a, b, c = (P(mw @ l.vert.co) for l in best)
+        w = barycentric_transform(Vector((q.x, q.y, 0.0)),
+                                  Vector((a.x, a.y, 0.0)), Vector((b.x, b.y, 0.0)), Vector((c.x, c.y, 0.0)),
+                                  Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0)), Vector((0.0, 0.0, 1.0)))
+        return sum(wi * (mw @ l.vert.co).z for wi, l in zip(w, best))
+
+    def lies_under(f, poly):
+        """The face the strip LIES ON: an area in common in plan AND the same height there.
+
+        Height matters: with a tolerance of a quarter of a metre, a road line laid at the foot of
+        a kerb took the kerb's top as well - it is 0.2 m up and right above the line in plan - and
+        cut it away, leaving the top of the kerb's face open (Dima's kerb, 25 Nov)."""
+        for sp, (so, sn) in zip(strip_polys, strip_planes):
+            for q in common_points(poly, sp):
+                z = ground_z(f, q)
+                if z is None:
+                    # on the face's outline: step a hair towards the strip's middle
+                    m = sum(sp, Vector((0.0, 0.0))) / len(sp)
+                    z = ground_z(f, q + (m - q) * 0.01)
+                if z is not None and abs(z - plane_z(so, sn, q)) <= 0.05:
+                    return True
+        return False
+
+    bm = bmesh.from_edit_mesh(src_obj.data)
+    all_tris = {}
+    for lt in bm.calc_loop_triangles():
+        all_tris.setdefault(lt[0].face, []).append(tuple(lt))
+
+    def face_tris(f):
+        return all_tris.get(f, [])
+
+    pad = 0.05
+    region = []
+    for f in bm.faces:
+        if f.hide:
+            continue
+        n = nm @ f.normal
+        if n.length_squared < 1e-12 or abs(n.normalized().z) < 0.5:
+            continue
+        w = [mw @ v.co for v in f.verts]
+        if (max(q.x for q in w) < lo.x - pad or min(q.x for q in w) > hi.x + pad or
+                max(q.y for q in w) < lo.y - pad or min(q.y for q in w) > hi.y + pad or
+                max(q.z for q in w) < zlo or min(q.z for q in w) > zhi):
+            continue
+        if lies_under(f, [P(q) for q in w]):
+            region.append(f)
+    if not region:
+        return "под полосой нет земли"
+
+    uv_layers = list(bm.loops.layers.uv.values())
+    col_layers = list(bm.loops.layers.color.values())
+    if hasattr(bm.loops.layers, "float_color"):
+        col_layers += list(bm.loops.layers.float_color.values())
+
+    # each face's own triangles (Blender's tessellation, right for a concave n-gon too)
+    tris = {f: all_tris.get(f, []) for f in region}
+
+    def sample(f, pt2):
+        """height, UVs and colours of face f at plan point pt2"""
+        hit, best = None, None
+        for t in tris[f]:
+            a, b, c = (P(mw @ l.vert.co) for l in t)
+            if intersect_point_tri_2d(pt2, a, b, c):
+                hit = t
+                break
+            d = (pt2 - (a + b + c) / 3.0).length
+            if best is None or d < best[0]:
+                best = (d, t)
+        t = hit or best[1]
+        a, b, c = (P(mw @ l.vert.co) for l in t)
+        w = barycentric_transform(Vector((pt2.x, pt2.y, 0.0)),
+                                  Vector((a.x, a.y, 0.0)), Vector((b.x, b.y, 0.0)), Vector((c.x, c.y, 0.0)),
+                                  Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0)), Vector((0.0, 0.0, 1.0)))
+        z = sum(wi * (mw @ l.vert.co).z for wi, l in zip(w, t))
+        uvs = []
+        for lay in uv_layers:
+            acc = Vector((0.0, 0.0))
+            for wi, l in zip(w, t):
+                acc += l[lay].uv * wi
+            uvs.append(acc)
+        cols = []
+        for lay in col_layers:
+            acc = Vector((0.0, 0.0, 0.0, 0.0))
+            for wi, l in zip(w, t):
+                acc += Vector(l[lay]) * wi
+            cols.append(acc)
+        return z, uvs, cols
+
+    # --- the plan arrangement: ground faces and strip faces together ---
+    gverts, gidx = [], {}
+    for f in region:
+        for v in f.verts:
+            if v not in gidx:
+                gidx[v] = len(gverts)
+                gverts.append(v)
+    coords = [P(mw @ v.co) for v in gverts]
+    in_faces = []
+    for f in region:
+        poly = [gidx[v] for v in f.verts]
+        if area2([coords[i] for i in poly]) < 0:
+            poly.reverse()
+        in_faces.append(poly)
+    n_gv, n_gf = len(coords), len(in_faces)
+    for p in me.polygons:
+        ids = [n_gv + i for i in p.vertices]
+        if area2([P(strip_v[i]) for i in p.vertices]) < 0:
+            ids.reverse()
+        in_faces.append(ids)
+    coords += [P(q) for q in strip_v]
+
+    out_v, _e, out_f, orig_v, _oe, orig_f = delaunay_2d_cdt(coords, [], in_faces, 4, 1e-5, True)
+
+    # The strip's own UV and height, read off its triangles. The strip is laid from the SAME
+    # arrangement as the ground round it, so every point where the ground was cut is a vertex of
+    # the strip as well - the two share their vertices by construction. Joining the preview as it
+    # was built and welding by distance instead left the whole run open wherever the ground gained
+    # a vertex the strip did not have: a strip end standing 6 mm past the face it lies on was
+    # enough for 19 m of open edge.
+    sbm = bmesh.new()
+    sbm.from_mesh(me)
+    s_uv = sbm.loops.layers.uv.active
+    s_tris = {}
+    for lt in sbm.calc_loop_triangles():
+        s_tris.setdefault(lt[0].face.index, []).append(tuple(lt))
+
+    def strip_sample(fi, pt2):
+        best, hit = None, None
+        for t in s_tris.get(fi, []):
+            a, b, c = (P(cw @ l.vert.co) for l in t)
+            if intersect_point_tri_2d(pt2, a, b, c):
+                hit = t
+                break
+            d = (pt2 - (a + b + c) / 3.0).length
+            if best is None or d < best[0]:
+                best = (d, t)
+        t = hit or best[1]
+        a, b, c = (P(cw @ l.vert.co) for l in t)
+        w = barycentric_transform(Vector((pt2.x, pt2.y, 0.0)),
+                                  Vector((a.x, a.y, 0.0)), Vector((b.x, b.y, 0.0)), Vector((c.x, c.y, 0.0)),
+                                  Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0)), Vector((0.0, 0.0, 1.0)))
+        z = sum(wi * (cw @ l.vert.co).z for wi, l in zip(w, t))
+        uv = Vector((0.0, 0.0))
+        if s_uv is not None:
+            for wi, l in zip(w, t):
+                uv += l[s_uv].uv * wi
+        return z, uv
+
+    # the strip's UV goes into the layer of the same name, the ground's values into the others
+    s_uv_name = s_uv.name if s_uv is not None else None
+    strip_uv_slot = None
+    for k, lay in enumerate(uv_layers):
+        if lay.name == s_uv_name:
+            strip_uv_slot = k
+    if strip_uv_slot is None and uv_layers:
+        strip_uv_slot = uv_layers.index(bm.loops.layers.uv.active) if bm.loops.layers.uv.active in uv_layers else 0
+
+    # material slot of the strip on the ground's object
+    mat = me.materials[0] if me.materials else None
+    strip_mat = 0
+    if mat is not None:
+        names = [m.name if m else "" for m in src_obj.data.materials]
+        if mat.name in names:
+            strip_mat = names.index(mat.name)
+        else:
+            src_obj.data.materials.append(mat)
+            strip_mat = len(src_obj.data.materials) - 1
+
+    # --- everything read off the old faces BEFORE they go ---
+    plans = []
+    strip_pieces = 0
+    for k, poly in enumerate(out_f):
+        grounds = [i for i in orig_f[k] if i < n_gf]
+        strips = [i - n_gf for i in orig_f[k] if i >= n_gf]
+        if not grounds and not strips:
+            continue
+        g = region[grounds[0]] if grounds else None
+        corners = []
+        for i in poly:
+            old = [j for j in orig_v[i] if j < n_gv]
+            if g is not None:
+                z, uvs, cols = sample(g, out_v[i])
+            else:
+                # the strip stands past the ground here: its own height, no ground values
+                z, uvs, cols = strip_sample(strips[0], out_v[i])[0], [Vector((0.0, 0.0))] * len(uv_layers), \
+                    [Vector((1.0, 1.0, 1.0, 1.0))] * len(col_layers)
+            if strips:
+                suv = strip_sample(strips[0], out_v[i])[1]
+                uvs = list(uvs)
+                if strip_uv_slot is not None:
+                    uvs[strip_uv_slot] = suv
+            corners.append((i, gverts[old[0]] if old else None, z, uvs, cols))
+        if strips:
+            strip_pieces += 1
+            up = (nm @ g.normal).z >= 0.0 if g is not None else True
+            plans.append((corners, strip_mat, g.smooth if g is not None else False, up))
+        else:
+            plans.append((corners, g.material_index, g.smooth, (nm @ g.normal).z >= 0.0))
+    sbm.free()
+
+    vert_of = {}
+    for corners, *_ in plans:
+        for i, v, z, uvs, cols in corners:
+            if i not in vert_of:
+                vert_of[i] = v if v is not None else bm.verts.new(
+                    inv @ Vector((out_v[i].x + origin.x, out_v[i].y + origin.y, z)))
+
+    replaced = len(region)
+    edges_before = {e for f in region for e in f.edges}
+    bmesh.ops.delete(bm, geom=region, context='FACES_ONLY')
+    made = 0
+    new_faces = []
+    for corners, mat_i, smooth, up in plans:
+        if not up:
+            corners = list(reversed(corners))
+        vs = [vert_of[c[0]] for c in corners]
+        if len(set(vs)) < 3:
+            continue
+        try:
+            nf = bm.faces.new(vs)
+        except ValueError:
+            continue
+        nf.material_index = mat_i
+        nf.smooth = smooth
+        for l, (i, v, z, uvs, cols) in zip(nf.loops, corners):
+            for lay, uv in zip(uv_layers, uvs):
+                l[lay].uv = uv
+            for lay, c in zip(col_layers, cols):
+                l[lay] = c
+        new_faces.append(nf)
+        made += 1
+    # edges only the old faces held, that nothing new took over
+    loose = [e for e in edges_before if e.is_valid and not e.link_faces]
+    if loose:
+        bmesh.ops.delete(bm, geom=loose, context='EDGES')
+    for f in bm.faces:
+        f.select = False
+    for f in new_faces:
+        if f.is_valid and f.material_index == strip_mat:
+            f.select = True
+    bm.normal_update()
+    bmesh.update_edit_mesh(src_obj.data)
+    return replaced, made, strip_pieces
 
 
 def _cut_under(obj, stamps):
