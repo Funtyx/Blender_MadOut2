@@ -15,6 +15,7 @@ from mathutils import Vector
 
 from .strip_resample import (StripResampleCore, _Fail, _arc, _chains_from_region, _dense_curve,
                              _sample)
+from . import fillet_radius
 from .ui_help import draw_help
 
 HELP = (
@@ -37,6 +38,11 @@ HELP = (
     "  3 — 38 (10), 4 — 42 (10), 5 — 44 (12),",
     "  дальше +2 на круг за каждый метр.",
     "  Радиус — по внешнему кольцу скругления.",
+    "Новый радиус — скругление строится заново:",
+    "  дуга касается тех же прямых, кольца идут",
+    "  следом, концы выделения на месте. Больше",
+    "  радиус — точки касания дальше от угла; если",
+    "  не влезает, скажет максимум (выделите прямые).",
     "Плавность 0 — точки на старых рёбрах, контур",
     "  не двигается; 1 — на гладкой дуге.",
     "Концы скругления не сдвигаются. Откат — Ctrl+Z.",
@@ -473,8 +479,9 @@ class FilletSectionsCore(StripResampleCore):
     """The strip machinery of Strip Resample (welding to the neighbours, UV, colours), with a hub side."""
 
     summary = (0, 0, False, 0, [], 0)
+    radius = 0.0  # the operator and the tab give their own; 0 keeps the rounding's radius
 
-    def _rebuild_with_extras(self, bm, ring, old_pts, targets, extras, chains):
+    def _rebuild_with_extras(self, bm, ring, old_pts, targets, extras, chains, moved=None):
         """The ring rebuilt on the section targets, with its extra points kept where they stand.
         Each extra goes in between the two sections it lies between (or IS the section, if one
         lands on it), and the ring is rebuilt piece by piece between them, so an extra is always
@@ -489,7 +496,7 @@ class FilletSectionsCore(StripResampleCore):
             v = ring[idx]
             if v not in extras:
                 continue
-            co = old_pts[idx]
+            co = moved[idx] if moved and idx in moved else old_pts[idx]
             best = min(range(len(merged) - 1),
                        key=lambda j: _point_segment(co, merged[j], merged[j + 1]))
             near = min((best, best + 1), key=lambda j: (merged[j] - co).length)
@@ -513,7 +520,7 @@ class FilletSectionsCore(StripResampleCore):
         A straight gets one section and nothing else - only its ends, where the arcs meet it."""
         old = max(len(r) - 1 for r in rings)
         n = len(rings[0]) - 1
-        pieces = _pieces(rings, mw, self.keep_straight) or [(0, n, False)]
+        pieces = _pieces(rings, mw, self.keep_straight) or [(0, n - 1, False)]
         arcs = [i for i, pc in enumerate(pieces) if not pc[2]]
         measured = {}
         for i in arcs:
@@ -543,6 +550,61 @@ class FilletSectionsCore(StripResampleCore):
             last_measure.update(arcs=found, straights=len(pieces) - len(arcs))
         return old, plan, found
 
+    def _reshaped(self, rings, mw):
+        """(old, plan, found, targets) for a rounding re-laid at self.radius on the LONGEST ring
+        (the one whose radius the table and the panel show), every ring moved by the same amount."""
+        old = max(len(r) - 1 for r in rings)
+        world = [[mw @ v.co for v in r] for r in rings]
+        frames = [fillet_radius.frame(p) for p in world]
+        if any(f is None for f in frames):
+            raise _Fail("Новый радиус — для одного скругления между двумя прямыми. У разворота или "
+                        "почти прямой полосы угла нет: выделите каждую дугу отдельно")
+        n = len(rings[0]) - 1
+        pieces = _pieces(rings, mw, True) or [(0, n - 1, False)]
+        if sum(1 for pc in pieces if not pc[2]) > 1:
+            raise _Fail("Здесь две дуги с прямой между ними: новый радиус задаётся каждой дуге отдельно")
+        straight = [False] * n
+        for first, last, flat in pieces:
+            for j in range(first, last + 1):
+                straight[j] = flat
+        radii = [fillet_radius.arc_radius(p, straight) for p in world]
+        ref = max(range(len(world)), key=lambda i: sum((b - a).length for a, b in zip(world[i], world[i][1:])))
+        layouts, err, _ = fillet_radius.reshape(frames, radii, ref, self.radius)
+        if err:
+            raise _Fail(err)
+        lay = layouts[ref]
+        turn = abs(lay["theta"])
+        straights = []
+        if lay["straight_a"] > fillet_radius.MIN_STRAIGHT:
+            straights.append("a")
+        if lay["straight_b"] > fillet_radius.MIN_STRAIGHT:
+            straights.append("b")
+        if self.mode == 'COUNT':
+            if self.count == 0:
+                self.count = old
+            k = max(1, self.count - len(straights))
+        elif self.mode == 'ANGLE':
+            k = max(1, round(self.seg_90 * math.degrees(turn) / 90.0))
+        else:
+            k = sections_by_table(turn, self.radius, self.even)
+        parts = ([("a", 1)] if "a" in straights else []) + [("arc", k)] + ([("b", 1)] if "b" in straights else [])
+        plan = []
+        at = 0
+        for kind, kk in parts:
+            plan.append((at, at, kind != "arc", kk))
+            at += 1
+        mwi = mw.inverted()
+        targets = []
+        for layout, p in zip(layouts, world):
+            xy = fillet_radius.lay_out(layout, parts)
+            zs = fillet_radius.heights(p, xy)
+            targets.append([mwi @ Vector((q.x, q.y, z)) for q, z in zip(xy, zs)])
+        found = [(turn, self.radius, k, radii[ref])]
+        if self.mode == 'TABLE':
+            last_measure.clear()
+            last_measure.update(arcs=found, straights=len(straights))
+        return old, plan, found, targets
+
     def _run(self, bm, obj):
         region = rounding_faces(bm)
         if not region:
@@ -554,7 +616,13 @@ class FilletSectionsCore(StripResampleCore):
         rings = [[v for v in r if v not in ex] for r, ex in zip(rings_full, extras)]
         if inner and extras[0]:
             raise _Fail("Лишняя точка на первом кольце веера: так пока не умею, уберите её или выделите без веера")
-        old, plan, found = self._plan(rings, obj.matrix_world)
+        mw = obj.matrix_world
+        reshaped = self._reshaped(rings, mw) if self.radius > 0.0 else None
+        if reshaped:
+            old, plan, found, ring_targets = reshaped
+        else:
+            old, plan, found = self._plan(rings, mw)
+            ring_targets = None
         count = sum(pc[3] for pc in plan)
 
         # A point welded to geometry outside the selection cannot be taken out without tearing that
@@ -567,7 +635,12 @@ class FilletSectionsCore(StripResampleCore):
 
         pts = [[v.co.copy() for v in r] for r in rings]
         full_pts = [[v.co.copy() for v in r] for r in rings_full]
-        new_inner = _inner_targets(inner, plan) if inner else None
+        if not inner:
+            new_inner = None
+        elif reshaped:
+            new_inner = _inner_reshaped(inner, count)
+        else:
+            new_inner = _inner_targets(inner, plan)
         chains = ([inner] if inner else []) + rings
         strips = self._capture_strips(bm, chains_full)
         old_uv = _capture_faces(chains, strips)
@@ -586,15 +659,22 @@ class FilletSectionsCore(StripResampleCore):
         # Each arc is smoothed on its own points only, so a straight beside it is not bent into it.
         new_chains = [new_inner] if inner else []
         sections = [list(range(count + 1))] if inner else []
-        for ring, ring_full, p, pf, ex in zip(rings, rings_full, pts, full_pts, extras):
-            targets = [p[0].copy()]
-            for first, last, straight, k in plan:
-                part = p[first:last + 2]
-                if straight:
-                    targets.append(part[-1].copy())
-                else:
-                    targets.extend(_sample(_dense_curve(part, self.smooth, set()), k)[1:])
-            chain, sec = self._rebuild_with_extras(bm, ring_full, pf, targets, ex, chains_full)
+        for ri, (ring, ring_full, p, pf, ex) in enumerate(zip(rings, rings_full, pts, full_pts, extras)):
+            moved = None
+            if ring_targets is not None:
+                targets = ring_targets[ri]
+                # A new radius moves the edge, and a point welded to it moves along: onto the new line
+                moved = {idx: _nearest_on(targets, pf[idx]) for idx in range(1, len(ring_full) - 1)
+                         if ring_full[idx] in ex}
+            else:
+                targets = [p[0].copy()]
+                for first, last, straight, k in plan:
+                    part = p[first:last + 2]
+                    if straight:
+                        targets.append(part[-1].copy())
+                    else:
+                        targets.extend(_sample(_dense_curve(part, self.smooth, set()), k)[1:])
+            chain, sec = self._rebuild_with_extras(bm, ring_full, pf, targets, ex, chains_full, moved)
             new_chains.append(chain)
             sections.append(sec)
 
@@ -659,6 +739,29 @@ def _capture_faces(chains, strips):
             faces.append(data)
         out.append({"faces": faces} if faces else None)
     return out
+
+
+def _nearest_on(pts, co):
+    """The point of a polyline nearest co."""
+    best = None
+    for a, b in zip(pts, pts[1:]):
+        d = b - a
+        l2 = d.length_squared
+        t = 0.0 if l2 < 1e-12 else max(0.0, min(1.0, (co - a).dot(d) / l2))
+        q = a + d * t
+        if best is None or (q - co).length < best[0]:
+            best = ((q - co).length, q)
+    return best[1].copy()
+
+
+def _inner_reshaped(inner, count):
+    """The hub side for a rounding laid out afresh: its two ends stay, every section between meets
+    the hub. A side that moves along the middle is a ring, not a hub."""
+    middle = inner[1:-1]
+    hub = middle[0] if middle else inner[0]
+    if any(v is not hub for v in middle):
+        raise _Fail("Внутренняя сторона скругления идёт по дуге, а не из одной точки: радиус так не поменять")
+    return [inner[0]] + [hub] * (count - 1) + [inner[-1]]
 
 
 def _point_segment(p, a, b):
@@ -753,7 +856,8 @@ def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side):
 def describe(summary):
     old, count, fan, rings, arcs, straights = summary
     what = f"веер и колец: {rings}" if fan else f"колец: {rings}"
-    parts = ", ".join(f"{math.degrees(t):.0f}° R {r:.2f} м → {k}" for t, r, k in arcs)
+    parts = ", ".join(f"{math.degrees(a[0]):.0f}° R " + (f"{a[3]:.2f} → " if len(a) > 3 else "")
+                      + f"{a[1]:.2f} м → {a[2]}" for a in arcs)
     if straights:
         parts += f"; прямых без сечений: {straights}"
     return f"Сечений {old} → {count} ({what}; {parts})"
@@ -781,6 +885,12 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
     seg_90: IntProperty(
         name="Сечений на 90°", default=8, min=1, max=256,
         description="Сколько шагов на четверть круга; скругление на 45° получит половину")
+    radius: FloatProperty(
+        name="Радиус", default=0.0, min=0.0, soft_max=50.0, unit='LENGTH', precision=2,
+        description="Новый радиус скругления (по внешнему кольцу, как в таблице); 0 — оставить как есть. "
+                    "Дуга строится заново касательной к тем же прямым, кольца сдвигаются вместе, ширина "
+                    "бордюра не меняется, концы выделения стоят на месте. Если радиус не помещается, "
+                    "инструмент скажет, какой максимум")
     keep_straight: BoolProperty(
         name="Прямые без сечений", default=True,
         description="Прямые участки между дугами (разворот, скругление с прямой вставкой) остаются одним "
@@ -823,7 +933,7 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
         return {'FINISHED'}
 
 
-PARAM_KEYS = ("mode", "count", "seg_90", "even", "keep_straight", "smooth")
+PARAM_KEYS = ("mode", "count", "seg_90", "even", "keep_straight", "smooth", "radius")
 
 
 def draw_params(layout, data, prefix, count_text=None):
@@ -841,6 +951,7 @@ def draw_params(layout, data, prefix, count_text=None):
             _draw_table(col)
     col.prop(data, prefix + "keep_straight")
     col.prop(data, prefix + "smooth")
+    col.prop(data, prefix + "radius", text="Новый радиус (0 = как есть)")
 
 
 def _draw_table(layout):
@@ -867,7 +978,7 @@ def _draw_table(layout):
     note = box.column(align=True)
     note.scale_y = 0.8
     note.label(text="Дальше +2 на круг за каждый метр")
-    for i, (turn, r, k) in enumerate(arcs):
+    for i, (turn, r, k) in enumerate(a[:3] for a in arcs):
         name = "Сейчас" if len(arcs) == 1 else f"Дуга {i + 1}"
         note.label(text=f"{name}: R {r:.2f} м → {segments_per_circle(r):.0f} на круг, "
                         f"{math.degrees(turn):.0f}° → {k}", icon='INFO' if i == 0 else 'BLANK1')
