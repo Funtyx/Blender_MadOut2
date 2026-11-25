@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Clean G-Curb From Selected Edges (Live Preview)",
     "author": "Dmitriy",
-    "version": (5, 26, 1),
+    "version": (5, 27, 0),
     "blender": (5, 0, 0),
     "location": "3D Viewport > N-panel > Curb",
     "description": (
@@ -19,6 +19,7 @@ import bmesh
 import math
 import json
 import os
+import zlib
 from mathutils import Matrix, Vector
 
 try:
@@ -77,6 +78,12 @@ PRESET_KEYS = (
     "uv_offset_u",
     "uv_offset_v",
     "uv_fit_part",
+    "uv_exact",
+    "uv_shelf_a",
+    "uv_shelf_b",
+    "uv_wall_a",
+    "uv_wall_b",
+    "uv_mirror_pos",
     # прочее
     "material_name",
     "merge_distance",
@@ -109,9 +116,18 @@ _BASE_PRESET = {
     "uv_offset_u": 0.0,
     "uv_offset_v": 0.0,
     "uv_fit_part": False,
+    "uv_exact": False,
+    "uv_shelf_a": 0.0,
+    "uv_shelf_b": 0.0,
+    "uv_wall_a": 0.0,
+    "uv_wall_b": 0.0,
+    "uv_mirror_pos": False,
     "material_name": "Curb_Mat",
     "merge_distance": 0.001,
 }
+
+
+_DEFAULT_WHEN_MISSING = ("uv_exact", "uv_shelf_a", "uv_shelf_b", "uv_wall_a", "uv_wall_b", "uv_mirror_pos")
 
 
 def _make_preset(**overrides):
@@ -239,6 +255,11 @@ def apply_preset_values(settings, values):
     try:
         for key in PRESET_KEYS:
             if key not in values:
+                # A preset saved before a key existed means that key's default, not whatever
+                # the previous preset left on the panel: an old preset applied after a captured
+                # one would otherwise keep the captured one's exact UV.
+                if key in _DEFAULT_WHEN_MISSING:
+                    setattr(settings, key, _BASE_PRESET[key])
                 continue
             try:
                 setattr(settings, key, values[key])
@@ -534,14 +555,25 @@ def invalidate_previews():
     _PRESET_ENUM_CACHE = []
 
 
+def _preset_number(name):
+    """The number Blender stores for this preset in the dropdown. It must belong to the NAME.
+
+    A dynamic enum keeps the number, not the name. With the position in the sorted list as the
+    number, adding a preset that sorts before the selected one moved the selection to its
+    neighbour: Dima saved "RoadLine", then "Road_Dvor" - which sorts just before it - and the
+    dropdown showed "Road_Dvor" while the panel held RoadLine's values."""
+    n = zlib.crc32(name.encode("utf-8")) & 0x3FFFFFFF
+    return n or 1
+
+
 def preset_enum_items(self, context):
     """Динамический список пресетов для дропдауна и галереи"""
     global _PRESET_ENUM_CACHE
     presets = load_presets()
     items = [(NO_PRESET, "— Не выбран —", "Пресет не применён", 0, 0)]
-    for i, name in enumerate(sorted(presets.keys(), key=lambda s: s.lower())):
+    for name in sorted(presets.keys(), key=lambda s: s.lower()):
         icon = preset_icon_id(name, presets[name])
-        items.append((name, name, f"Применить пресет «{name}»", icon, i + 1))
+        items.append((name, name, f"Применить пресет «{name}»", icon, _preset_number(name)))
     _PRESET_ENUM_CACHE = items
     return _PRESET_ENUM_CACHE
 
@@ -1015,6 +1047,31 @@ class CurbSettings(PropertyGroup):
         update=_update_preview,
     )
 
+    uv_exact: BoolProperty(
+        name="UV как у образца",
+        description=(
+            "UV полки и стенки — ровно те значения атласа, что сняты с выделенных граней: где "
+            "полоса начинается у ребра, где излом, куда смотрит зеркало. Ставится захватом "
+            "пресета с граней"
+        ),
+        default=False,
+        update=_update_preview,
+    )
+    uv_shelf_a: FloatProperty(name="Полка у ребра", description="Значение UV поперёк у первого ряда полки",
+                              default=0.0, precision=4, update=_update_preview)
+    uv_shelf_b: FloatProperty(name="Полка дальше", description="Значение UV поперёк у второго ряда полки",
+                              default=0.0, precision=4, update=_update_preview)
+    uv_wall_a: FloatProperty(name="Стенка у ребра", description="Значение UV поперёк у первого ряда стенки",
+                             default=0.0, precision=4, update=_update_preview)
+    uv_wall_b: FloatProperty(name="Стенка дальше", description="Значение UV поперёк у второго ряда стенки",
+                             default=0.0, precision=4, update=_update_preview)
+    uv_mirror_pos: BoolProperty(
+        name="Зеркало образца",
+        description="Как развёртка образца повёрнута относительно его нормали (снимается с граней)",
+        default=False,
+        update=_update_preview,
+    )
+
     # ---- Bake ----
     merge_distance: FloatProperty(
         name="Merge Distance",
@@ -1302,7 +1359,18 @@ def _finish_preview(context, settings, bm):
                 j = (i + 1) % len(pts)
                 a2 += pts[i].x * pts[j].y - pts[j].x * pts[i].y
             total += a2 * (1.0 if f.normal.z >= 0.0 else -1.0)
-        if total > 0.0:
+        if settings.build_mode == 'CURB' and settings.uv_exact:
+            # Captured off a sample: the mirror is the sample's, and it is put right by turning
+            # the strip round ALONG its length. Negating V, as below, is negating the ACROSS axis
+            # when the band runs along V - the band then lands on -0.67..-0.5 of the atlas instead
+            # of 0.5..0.67, another stone altogether (Dima's Tile_105 kerb, 25 Nov).
+            if (total > 0.0) != settings.uv_mirror_pos:
+                along_is_v = settings.uv_orientation == 'HORIZONTAL'
+                for f in bm.faces:
+                    for l in f.loops:
+                        t = l[uv_lay].uv
+                        l[uv_lay].uv = (t.x, -t.y) if along_is_v else (-t.x, t.y)
+        elif total > 0.0:
             for f in bm.faces:
                 for l in f.loops:
                     t = l[uv_lay].uv
@@ -2002,7 +2070,12 @@ def build_curb_preview(context):
     width_frac = width / profile_len
     height_frac = height / profile_len
 
-    if settings.uv_fit_part and settings.parts_mode != 'BOTH':
+    exact = settings.uv_exact
+    if exact:
+        # Values of the atlas themselves, row by row, as captured off the sample
+        shelf_band = (settings.uv_shelf_a, settings.uv_shelf_b)
+        wall_band = (settings.uv_wall_a, settings.uv_wall_b)
+    elif settings.uv_fit_part and settings.parts_mode != 'BOTH':
         # одна часть — растягиваем её на всю полосу
         shelf_band = (0.0, 1.0)
         wall_band = (0.0, 1.0)
@@ -2019,7 +2092,7 @@ def build_curb_preview(context):
 
     def _uv(a, b):
         """a — координата вдоль бордюра, b — позиция поперёк профиля (0..1)"""
-        band = b * y_size + y_offset
+        band = (b + y_offset) if exact else (b * y_size + y_offset)
         if horizontal:
             u, v = band, a
         else:
@@ -2028,6 +2101,9 @@ def build_curb_preview(context):
             u = -u
         if flip_v:
             v = -v
+        if exact:
+            u += off_u
+            v += off_v
         return (u, v)
 
     def _set_face_uv(face, u_i, u_j, band):
@@ -2356,7 +2432,7 @@ class CURB_OT_preset_save(Operator):
         s = context.scene.curb_settings
         src = _selected_faces_source(context)
         if src:
-            data, err = _analyse_curb_object(src[0], src[2], src[1])
+            data, err = _analyse_curb_object(src[0], src[2], src[1], s)
             if data is None:
                 self.report({'ERROR'}, err)
                 return {'CANCELLED'}
@@ -2396,7 +2472,7 @@ def _uv_continuous(edge, face, uv_lay, eps=1e-4, same_plane=0.9):
     return False
 
 
-def _analyse_curb_object(obj, faces=None, bm=None):
+def _analyse_curb_object(obj, faces=None, bm=None, settings=None):
     """
     Разбирает бордюр по ВЫДЕЛЕННЫМ граням: ширина, высота, части, материал, UV.
     Сечение считаем по «перемычкам» — коротким рёбрам граней.
@@ -2464,9 +2540,15 @@ def _analyse_curb_object(obj, faces=None, bm=None):
             orient_sum[0] += a2 * (1.0 if n.z >= 0.0 else -1.0)
 
         if uv_lay is not None:
+            longest = max(d for d, e in lens)
             for l in f.loops:
                 if rib_edges is not None and l.edge in rib_edges:
                     continue    # масштаб UV меряем только вдоль бордюра
+                if rib_edges is None and l.edge.calc_length() * mw.median_scale < 0.5 * longest:
+                    # No neighbour to tell the ribs by (a strip selected on its own): the short
+                    # edges are still the ribs. Counted in, they took the median off the length -
+                    # 0.294 for a kerb laid at 0.287, half a tile of drift over its 78 m.
+                    continue
                 nxt = l.link_loop_next
                 d3 = ((mw @ l.vert.co) - (mw @ nxt.vert.co)).length
                 d2 = (Vector((l[uv_lay].uv.x, l[uv_lay].uv.y, 0.0)) -
@@ -2480,10 +2562,11 @@ def _analyse_curb_object(obj, faces=None, bm=None):
         vs = [l[uv_lay].uv.y for f in faces for l in f.loops]
         across_span = [max(us) - min(us), max(vs) - min(vs)]
         uv_stats = (min(us), max(us), min(vs), max(vs))
-    if own:
-        bm.free()
+    bm_for_exact = bm
 
     if not flat_len and not wall_len:
+        if own:
+            bm.free()
         return None, "не удалось разобрать сечение"
 
     # грани бордюра — это всегда Г-Curb, а не заливка Bridge
@@ -2526,8 +2609,142 @@ def _analyse_curb_object(obj, faces=None, bm=None):
         # нормали — отрицательная). Если у захваченного объекта она обратная,
         # значит нужен Flip, иначе текстура ляжет зеркально.
         data["uv_flip_v"] = orient_sum[0] > 0.0
+        exact = _capture_exact_uv(bm_for_exact, faces, mw, uv_lay, across_u,
+                                  getattr(settings, "profile_mode", 'BOTTOM_INNER'))
+        if exact is not None:
+            data.update(exact)
+            # the exact values say all of it; the old band knobs are left neutral
+            data["uv_flip_u"] = False
+            data["uv_flip_v"] = False
+            data["uv_y_offset"] = 0.0
 
+    if own:
+        bm.free()
     return data, ""
+
+
+def _capture_exact_uv(bm, faces, mw, uv_lay, across_u, mode):
+    """The atlas values across the strip at each row of the profile, and the sample's mirror.
+
+    The old capture kept a band size and the band's LOWEST value. That loses two things the
+    builder needs: which end of the band is at the edge the kerb is built from (on Dima's Tile_89
+    road line 0.442 is at the sidewalk and 0.397 at the road; the capture laid it the other way
+    round), and where the arris is (Tile_105: the top takes 0.5825..0.67 and the face 0.5..0.5825,
+    not the 60/40 split of 0.298 m against 0.2 m). Here every row gets its own number.
+
+    Rows are the builder's: P0 on the selected edge, P1 the corner, P2 the end. Which edge of the
+    sample is P0 follows from the profile type on the panel when it holds both parts; a lone
+    shelf is built from the long edge beside something higher (a kerb, a sidewalk) - the edge a
+    road line is drawn from; a lone wall from its top for the types that go down."""
+    if uv_lay is None or bm is None:
+        return None
+    ax = 0 if across_u else 1
+    nm = mw.to_3x3()
+
+    def across(l):
+        return l[uv_lay].uv[ax]
+
+    shelves, walls = [], []
+    for f in faces:
+        n = nm @ f.normal
+        if n.length_squared < 1e-12:
+            continue
+        (shelves if abs(n.normalized().z) >= 0.5 else walls).append(f)
+
+    def long_edges(f):
+        """(across value, world midpoint, edge) of the edges running along the strip: the ones
+        whose across value does not change from end to end."""
+        out = []
+        for l in f.loops:
+            nxt = l.link_loop_next
+            a0, a1 = across(l), across(nxt)
+            other = 1 - ax
+            d_along = abs(l[uv_lay].uv[other] - nxt[uv_lay].uv[other])
+            if abs(a1 - a0) <= max(1e-4, 0.05 * d_along):
+                out.append(((a0 + a1) * 0.5, mw @ ((l.vert.co + nxt.vert.co) * 0.5), l.edge))
+        return out
+
+    def near(p, pts, tol=0.03):
+        return any((p - q).length <= tol for q in pts)
+
+    def mean(xs):
+        return sum(xs) / len(xs) if xs else None
+
+    shelf_first = mode.startswith(("BOTTOM", "UP"))
+    wall_down = mode.startswith(("BOTTOM", "DOWN"))
+    out = {"uv_exact": True}
+
+    if shelves and walls:
+        wall_pts = [mw @ v.co for f in walls for v in f.verts]
+        shelf_pts = [mw @ v.co for f in shelves for v in f.verts]
+        s_corner, s_free, w_corner, w_free = [], [], [], []
+        for f in shelves:
+            for a, mid, e in long_edges(f):
+                both = all(near(mw @ v.co, wall_pts) for v in e.verts)
+                (s_corner if both else s_free).append(a)
+        for f in walls:
+            for a, mid, e in long_edges(f):
+                both = all(near(mw @ v.co, shelf_pts) for v in e.verts)
+                (w_corner if both else w_free).append(a)
+        sc, sf, wc, wf = mean(s_corner), mean(s_free), mean(w_corner), mean(w_free)
+        if None in (sc, sf, wc, wf):
+            return None
+        if shelf_first:
+            out.update(uv_shelf_a=sf, uv_shelf_b=sc, uv_wall_a=wc, uv_wall_b=wf)
+        else:
+            out.update(uv_wall_a=wf, uv_wall_b=wc, uv_shelf_a=sc, uv_shelf_b=sf)
+    elif shelves:
+        # the two long sides of the strip, and whether something rises beside each
+        sel = set(faces)
+        sides = {}
+        for f in shelves:
+            for a, mid, e in long_edges(f):
+                key = round(a, 3)
+                sides.setdefault(key, [a, 0.0, 0])
+                sides[key][2] += 1
+                rise = 0.0
+                for g in e.link_faces:
+                    if g in sel:
+                        continue
+                    gn = (nm @ g.normal).normalized()
+                    gz = (mw @ g.calc_center_median()).z
+                    if abs(gn.z) < 0.5 or gz > mid.z + 0.03:
+                        rise = max(rise, 1.0)
+                sides[key][1] = max(sides[key][1], rise)
+        if len(sides) < 2:
+            return None
+        two = sorted(sides.values(), key=lambda t: -t[2])[:2]
+        if two[0][1] != two[1][1]:
+            base, far = (two[0], two[1]) if two[0][1] > two[1][1] else (two[1], two[0])
+        else:
+            base, far = sorted(two, key=lambda t: t[0])
+        out.update(uv_shelf_a=base[0], uv_shelf_b=far[0], uv_wall_a=0.0, uv_wall_b=0.0)
+    elif walls:
+        tops, bots = [], []
+        for f in walls:
+            le = long_edges(f)
+            if len(le) < 2:
+                continue
+            le.sort(key=lambda t: t[1].z)
+            bots.append(le[0][0])
+            tops.append(le[-1][0])
+        if not tops:
+            return None
+        t, b = mean(tops), mean(bots)
+        out.update(uv_wall_a=t if wall_down else b, uv_wall_b=b if wall_down else t,
+                   uv_shelf_a=0.0, uv_shelf_b=0.0)
+    else:
+        return None
+
+    total = 0.0
+    for f in faces:
+        n = nm @ f.normal
+        pts = [l[uv_lay].uv for l in f.loops]
+        a2 = sum(pts[i].x * pts[(i + 1) % len(pts)].y - pts[(i + 1) % len(pts)].x * pts[i].y
+                 for i in range(len(pts)))
+        total += a2 * (1.0 if n.z >= 0.0 else -1.0)
+    out["uv_mirror_pos"] = total > 0.0
+    return out
 
 
 class CURB_OT_preset_from_object(Operator):
@@ -2569,9 +2786,9 @@ class CURB_OT_preset_from_object(Operator):
                 self.report({'ERROR'}, "Выдели грани бордюра")
                 return {'CANCELLED'}
             obj = src[0]
-            data, err = _analyse_curb_object(src[0], src[2], src[1])
+            data, err = _analyse_curb_object(src[0], src[2], src[1], context.scene.curb_settings)
         else:
-            data, err = _analyse_curb_object(obj)
+            data, err = _analyse_curb_object(obj, settings=context.scene.curb_settings)
         if data is None:
             self.report({'ERROR'}, err)
             return {'CANCELLED'}
@@ -3453,9 +3670,23 @@ class CURB_PT_panel(Panel):
             row.prop_enum(s, "uv_align", 'SIDE_A')
             row.prop_enum(s, "uv_align", 'SIDE_B')
         col.prop(s, "uv_scale_u", text="UV Tiling Scale" if bridge else "UV Length Scale")
+        exact = s.uv_exact and not bridge
         if not bridge:
+            col.prop(s, "uv_exact", toggle=True, icon='EYEDROPPER')
+        if exact:
+            box = col.box().column(align=True)
+            box.label(text="Поперёк — значения атласа образца:")
+            if s.parts_mode in ('BOTH', 'SHELF'):
+                r = box.row(align=True)
+                r.prop(s, "uv_shelf_a", text="Полка")
+                r.prop(s, "uv_shelf_b", text="→")
+            if s.parts_mode in ('BOTH', 'WALL'):
+                r = box.row(align=True)
+                r.prop(s, "uv_wall_a", text="Стенка")
+                r.prop(s, "uv_wall_b", text="→")
+        elif not bridge:
             col.prop(s, "uv_y_size")
-        col.prop(s, "uv_y_offset", text="UV Across Offset" if bridge else "UV Band Offset")
+        col.prop(s, "uv_y_offset", text="UV Across Offset" if bridge else ("Сдвиг поперёк" if exact else "UV Band Offset"))
         row = col.row(align=True)
         row.prop(s, "uv_flip_u", toggle=True)
         row.prop(s, "uv_flip_v", toggle=True)
