@@ -738,11 +738,12 @@ class FilletSectionsCore(StripResampleCore):
         # of the old edge says it exactly. A new radius moves the edge, up to metres: the nearest
         # point then is the wrong one - several new points caught on one old one, the texture
         # squeezed to nothing and faces turned over (measured at 12 m: density 0, 8 of 64 flipped).
-        # So a moved ring is read along itself in metres, from each end (see _by_metres).
-        where = [None] * len(new_chains)
+        # So a moved strip is read along its middle line in metres, from each end (_strip_readings).
+        reads = [None] * len(strips)
         if reshaped:
-            for ci in range(1 if inner else 0, len(new_chains)):
-                where[ci] = _by_metres(new_chains[ci], old_pts[ci])
+            for i in range(len(strips)):
+                reads[i] = _strip_readings(new_chains[i], sections[i], new_chains[i + 1], sections[i + 1],
+                                           old_pts[i], old_pts[i + 1], count)
 
         faces = []
         for i, s in enumerate(strips):
@@ -763,7 +764,7 @@ class FilletSectionsCore(StripResampleCore):
                 faces.append(f)
                 if old_uv[i] is not None:
                     _map_loops(f, old_uv[i], old_pts[i], old_pts[i + 1], s, a_side, b_side,
-                               where[i], where[i + 1], 0 if k < count // 2 else 1)
+                               (reads[i][0], reads[i][1][k]) if reads[i] else None)
                 else:
                     self._interpolate_loops(bm, f, s)
 
@@ -875,24 +876,51 @@ def _reading(acc, st):
     return k, (st - acc[k]) / (acc[k + 1] - acc[k]), st
 
 
-def _by_metres(chain, old_pts):
-    """vertex -> (reading from the start, reading from the end) on the old chain, in METRES.
+def _strip_readings(chain_a, sec_a, chain_b, sec_b, old_a, old_b, count):
+    """Where each new point of one strip reads its texture: (old middle-line stations, and per new
+    face a vertex -> (old face, fraction, station) map). Used when a new radius has moved the edge.
 
-    Dima, on a share of length: "не нужно растягивать её, а просто продолжить". A ring that got
-    longer or shorter keeps its texture's scale: read from the start, a point so many metres in
-    takes the UV of the old ring so many metres in, the same read back from the far end, and the
-    face loop takes the start reading for the first half of the sections and the end reading for
-    the second. Both ends meet their neighbours exactly; the one joint is at the middle section."""
-    new_acc = [0.0]
-    for a, b in zip(chain, chain[1:]):
-        new_acc.append(new_acc[-1] + (b.co - a.co).length)
-    old_acc = _along(old_pts)
-    total_new, total_old = new_acc[-1], old_acc[-1]
-    return {v: (_reading(old_acc, d), _reading(old_acc, total_old - (total_new - d)))
-            for v, d in zip(chain, new_acc)}
+    Two things the texture needs, each learned from a broken result:
+    - CONTINUE, never stretch (Dima: "не нужно растягивать её, а просто продолжить"): read in
+      metres. Read by share of length, a ring that got longer stretched its texture 16 per cent.
+    - ONE reading for both edges of a face. Read in each edge's own metres, the outer edge of an arc
+      - longer than the inner one - ran ahead of it section by section and the stone joints leant
+      over ("тянут текстуру"). So a section is placed by the strip's MIDDLE line, the mean of its two
+      edges, and both corners of the section take that same old face and fraction - a joint across
+      the kerb stays across it.
+    The first half of the sections reads from the start, the second from the far end, so both ends
+    meet their neighbours exactly; the one joint is at the middle section."""
+    def acc(points):
+        out = [0.0]
+        for p, q in zip(points, points[1:]):
+            out.append(out[-1] + (q - p).length)
+        return out
+
+    old_mid = [(x + y) * 0.5 for x, y in zip(acc(old_a), acc(old_b))]
+    da = acc([v.co for v in chain_a])
+    db = acc([v.co for v in chain_b])
+    mid = [(da[sa] + db[sb]) * 0.5 for sa, sb in zip(sec_a, sec_b)]
+    total_new, total_old = mid[-1], old_mid[-1]
+
+    def at(t, half):
+        return _reading(old_mid, t if half == 0 else total_old - (total_new - t))
+
+    faces = []
+    for k in range(count):
+        half = 0 if k < count // 2 else 1
+        out = {}
+        for chain, d, sec in ((chain_a, da, sec_a), (chain_b, db, sec_b)):
+            i0, i1 = sec[k], sec[k + 1]
+            for idx in range(i0, i1 + 1):
+                span = d[i1] - d[i0]
+                u = (d[idx] - d[i0]) / span if span > 1e-9 else (0.0 if idx == i0 else 1.0)
+                t = mid[k] + (mid[k + 1] - mid[k]) * u
+                out[chain[idx]] = at(t, half)
+        faces.append(out)
+    return old_mid, faces
 
 
-def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side, where_a=None, where_b=None, half=0):
+def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side, reads=None):
     """
     UV and colours of a new face, read off the old faces of its strip by where each corner lies
     ALONG the strip, never by which old triangle is nearest in space.
@@ -915,9 +943,10 @@ def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side, where_a=None, wh
     olds = data["faces"]
     acc_b = _along(pts_b)
     acc_a = _along(pts_a)
-    if where_b is not None:
-        st = (where_b[b_side[0]][half][2] + where_b[b_side[-1]][half][2]) * 0.5
-        ref = _reading(acc_b, st)[0]
+    if reads is not None:
+        acc_mid, known = reads
+        st = (known[b_side[0]][2] + known[b_side[-1]][2]) * 0.5
+        ref = _reading(acc_mid, st)[0]
     else:
         mid = (b_side[0].co + b_side[-1].co) * 0.5
         ref = _project(pts_b, acc_b, mid)[0]
@@ -935,9 +964,9 @@ def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side, where_a=None, wh
 
     def value(side, vert, kind, li):
         pts, acc = (pts_a, acc_a) if side == "a" else (pts_b, acc_b)
-        known = where_a if side == "a" else where_b
-        if known is not None and vert in known:
-            c, f, st = known[vert][half]
+        if reads is not None and vert in reads[1]:
+            c, f, st = reads[1][vert]
+            acc = reads[0]  # stations are on the middle line
         else:
             c, f, st = _project(pts, acc, vert.co, prefer=ref)
         if c != ref and not joined(ref, c, kind, li):
