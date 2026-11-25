@@ -15,7 +15,7 @@ from mathutils import Vector
 
 from .strip_resample import (StripResampleCore, _Fail, _arc, _chains_from_region, _dense_curve,
                              _sample)
-from . import fillet_radius
+from . import fillet_align, fillet_radius
 from .ui_help import draw_help
 
 HELP = (
@@ -36,7 +36,8 @@ HELP = (
     "  R 0.25 м — 16 на круг (4 на 90°), 0.5 — 24 (6),",
     "  1 — 28 (8), 1.5 — 32 (8), 2 — 34 (8), 2.5 — 36 (10),",
     "  3 — 38 (10), 4 — 42 (10), 5 — 44 (12),",
-    "  дальше +2 на круг за каждый метр.",
+    "  больше 5 м — изгиб дороги: сечения через",
+    "  «Шаг на длинных дугах» (по умолчанию 4 м).",
     "  Радиус — по внешнему кольцу скругления.",
     "Новый радиус — скругление строится заново:",
     "  дуга касается тех же прямых, кольца идут",
@@ -359,6 +360,17 @@ def sections_by_table(turn, radius, even):
     return max(1, int(math.floor(x + 0.5)))
 
 
+def sections_long(turn, length, step, even):
+    """Past the table's last row a rounding is a road's bend, not a corner, and carrying the table
+    on (+2 a metre) gave a 50 m bend 22 sections. There the count is by a step along the arc, but
+    never coarser in angle than the table's 5 m row."""
+    per = CIRCLE_TABLE[-1][1]
+    x = max(per * math.radians(round(math.degrees(turn))) / (2.0 * math.pi), length / max(step, 0.01)) + 1e-6
+    if even:
+        return max(2, int(math.floor(x / 2.0 + 0.5)) * 2)
+    return max(1, int(math.floor(x + 0.5)))
+
+
 def rounding_faces(bm):
     """The selected faces that can be part of a rounding. An n-gon selected with it is usually the
     plot or the island it runs round - left in, it hides the ends of the band; left out, it is
@@ -427,6 +439,72 @@ def _expand(inner, ring, region):
             out.append(p)
         out.append(q)
     return out
+
+
+def _layer_beyond(region, chain):
+    """The strip of faces just outside one edge chain of the selection - one face across each chain
+    edge, plus any face touching the chain at a point between them - or None if what lies there is
+    not one (the plot as one n-gon, a face across two chain edges)."""
+    layer = []
+    on_chain = set()
+    for a, b in zip(chain, chain[1:]):
+        e = next((g for g in a.link_edges if g.other_vert(a) is b), None)
+        if e is None:
+            return None
+        on_chain.add(e)
+        outs = [f for f in e.link_faces if f not in region]
+        if len(outs) != 1 or len(outs[0].verts) > 4:
+            return None
+        layer.append(outs[0])
+    if len(set(layer)) != len(layer):
+        return None
+    for f in layer:
+        if sum(1 for e in f.edges if e in on_chain) != 1:
+            return None
+    out = set(layer)
+    # A strip beyond may also hold triangles that touch the chain by one point only - the footway
+    # beside Dima's kerb has three, their base on the far side. They belong to the strip too; whether
+    # the whole is a clean strip is then decided by reading it (find_rings in grow_across).
+    for v in chain[1:-1]:
+        for f in v.link_faces:
+            if f not in region and f not in out:
+                if len(f.verts) > 4:
+                    return None
+                out.add(f)
+    return out
+
+
+def grow_across(region, layers=12):
+    """The selection grown across the strips that run alongside it - the footway beside a kerb, the
+    kerb on its far side - for as long as each next one is a clean strip along the whole rounding.
+    A kerb resampled on its own leaves the footway beside it with the old sections and every new
+    point welded into its edge (Dima, on one kerb picked alone: "линии не красиво
+    распределяются")."""
+    taken = 0
+    for _ in range(layers):
+        try:
+            inner, rings = find_rings(region)
+        except _Fail:
+            break
+        sides = [rings[-1]] + ([] if inner else [rings[0]])
+        grew = False
+        for chain in sides:
+            layer = _layer_beyond(region, chain)
+            if not layer:
+                continue
+            trial = region | layer
+            try:
+                _, more = find_rings(trial)
+            except _Fail:
+                continue
+            if len(more) > len(rings):
+                region = trial
+                taken += 1
+                grew = True
+                break
+        if not grew:
+            break
+    return region, taken
 
 
 def find_rings(region):
@@ -512,8 +590,10 @@ def _continuation(region, chains, ends):
 class FilletSectionsCore(StripResampleCore):
     """The strip machinery of Strip Resample (welding to the neighbours, UV, colours), with a hub side."""
 
-    summary = (0, 0, False, 0, [], 0)
+    summary = (0, 0, False, 0, [], 0, 0)
     radius = 0.0  # the operator and the tab give their own; 0 keeps the rounding's radius
+    long_step = 4.0
+    take_band = False
 
     def _rebuild_with_extras(self, bm, ring, old_pts, targets, extras, chains, moved=None):
         """The ring rebuilt on the section targets, with its extra points kept where they stand.
@@ -576,13 +656,18 @@ class FilletSectionsCore(StripResampleCore):
                 counts[i] = max(1, round(self.seg_90 * math.degrees(measured[i][0]) / 90.0))
         else:
             for i in arcs:
-                counts[i] = sections_by_table(measured[i][0], measured[i][1], self.even)
+                counts[i] = self._table_count(measured[i][0], measured[i][1])
         plan = [(pc[0], pc[1], pc[2], counts[i]) for i, pc in enumerate(pieces)]
         found = [(measured[i][0], measured[i][1], counts[i]) for i in arcs]
         if self.mode == 'TABLE':
             last_measure.clear()
             last_measure.update(arcs=found, straights=len(pieces) - len(arcs))
         return old, plan, found
+
+    def _table_count(self, turn, radius):
+        if radius > CIRCLE_TABLE[-1][0]:
+            return sections_long(turn, turn * radius, self.long_step, self.even)
+        return sections_by_table(turn, radius, self.even)
 
     def _reshaped(self, rings, mw):
         """(old, plan, found, targets) for a rounding re-laid at self.radius on the LONGEST ring
@@ -622,7 +707,7 @@ class FilletSectionsCore(StripResampleCore):
         elif self.mode == 'ANGLE':
             k = max(1, round(self.seg_90 * math.degrees(turn) / 90.0))
         else:
-            k = sections_by_table(turn, self.radius, self.even)
+            k = self._table_count(turn, self.radius)
         parts = ([("a", 1)] if "a" in straights else []) + [("arc", k)] + ([("b", 1)] if "b" in straights else [])
         plan = []
         at = 0
@@ -645,6 +730,9 @@ class FilletSectionsCore(StripResampleCore):
         region = rounding_faces(bm)
         if not region:
             raise _Fail("Выделите грани скругления: веер от центра и кольца вокруг него")
+        self.taken = 0
+        if self.take_band:
+            region, self.taken = grow_across(region)
 
         mw = obj.matrix_world
         taken = 0
@@ -713,6 +801,22 @@ class FilletSectionsCore(StripResampleCore):
         # angle on every ring, so the new sections run straight out from the centre, and a ring's
         # ends stay where they are - they are the seams with the straight runs either side.
         # Each arc is smoothed on its own points only, so a straight beside it is not bent into it.
+        # Every arc piece laid out on all rings at once, at the same angles from its centre, so the
+        # sections run straight across the band (fillet_align); a piece it cannot do keeps the
+        # per-ring share of length.
+        aligned = {}
+        if ring_targets is None:
+            mwi = mw.inverted()
+            longest = max(range(len(rings)), key=lambda i: sum((b - a).length for a, b in zip(pts[i], pts[i][1:])))
+            for pi, (first, last, straight, k) in enumerate(plan):
+                if straight or k < 2:
+                    continue
+                denses = [_dense_curve([mw @ q for q in p[first:last + 2]], self.smooth, set()) for p in pts]
+                ref_t = _sample(denses[longest], k)
+                got = fillet_align.align(denses, ref_t, longest)
+                if got:
+                    aligned[pi] = [[mwi @ q for q in ring_pts] for ring_pts in got]
+
         new_chains = [new_inner] if inner else []
         sections = [list(range(count + 1))] if inner else []
         for ri, (ring, ring_full, p, pf, ex) in enumerate(zip(rings, rings_full, pts, full_pts, extras)):
@@ -724,10 +828,12 @@ class FilletSectionsCore(StripResampleCore):
                          if ring_full[idx] in ex}
             else:
                 targets = [p[0].copy()]
-                for first, last, straight, k in plan:
+                for pi, (first, last, straight, k) in enumerate(plan):
                     part = p[first:last + 2]
                     if straight:
                         targets.append(part[-1].copy())
+                    elif pi in aligned:
+                        targets.extend(aligned[pi][ri][1:])
                     else:
                         targets.extend(_sample(_dense_curve(part, self.smooth, set()), k)[1:])
             chain, sec = self._rebuild_with_extras(bm, ring_full, pf, targets, ex, chains_full, moved)
@@ -777,7 +883,8 @@ class FilletSectionsCore(StripResampleCore):
             f.select = True
         bm.select_flush(True)
         bm.normal_update()
-        self.summary = (old, count, inner is not None, len(rings), found, sum(1 for pc in plan if pc[2]))
+        self.summary = (old, count, inner is not None, len(rings), found, sum(1 for pc in plan if pc[2]),
+                        self.taken)
         return faces
 
 
@@ -989,12 +1096,15 @@ def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side, reads=None):
 
 
 def describe(summary):
-    old, count, fan, rings, arcs, straights = summary
+    old, count, fan, rings, arcs, straights = summary[:6]
+    taken = summary[6] if len(summary) > 6 else 0
     what = f"веер и колец: {rings}" if fan else f"колец: {rings}"
     parts = ", ".join(f"{math.degrees(a[0]):.0f}° R " + (f"{a[3]:.2f} → " if len(a) > 3 else "")
                       + f"{a[1]:.2f} м → {a[2]}" for a in arcs)
     if straights:
         parts += f"; прямых без сечений: {straights}"
+    if taken:
+        parts += f"; захвачено соседних полос: {taken}"
     return f"Сечений {old} → {count} ({what}; {parts})"
 
 
@@ -1026,6 +1136,15 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
                     "Дуга строится заново касательной к тем же прямым, кольца сдвигаются вместе, ширина "
                     "бордюра не меняется. Больший радиус сам берёт грани прямых за концами выделения; "
                     "если прямая кончается, инструмент скажет, какой максимум")
+    long_step: FloatProperty(
+        name="Шаг на длинных дугах", default=4.0, min=0.2, soft_max=20.0, unit='LENGTH', precision=1,
+        description="Таблица кончается на радиусе 5 м. Больше — это изгиб дороги, а не угол: сечения "
+                    "ставятся через этот шаг вдоль дуги (но не реже, чем на радиусе 5 м по углу)")
+    take_band: BoolProperty(
+        name="Захватывать соседние полосы", default=True,
+        description="Если выделен только бордюр, взять и полосы рядом, которые идут вдоль скругления "
+                    "(тротуар, второй бордюр), чтобы сечения прошли через них ровно. Останавливается "
+                    "на площадке, траве из треугольников и любой неровной сетке")
     keep_straight: BoolProperty(
         name="Прямые без сечений", default=True,
         description="Прямые участки между дугами (разворот, скругление с прямой вставкой) остаются одним "
@@ -1068,7 +1187,7 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
         return {'FINISHED'}
 
 
-PARAM_KEYS = ("mode", "count", "seg_90", "even", "keep_straight", "smooth", "radius")
+PARAM_KEYS = ("mode", "count", "seg_90", "even", "long_step", "keep_straight", "take_band", "smooth", "radius")
 
 
 def draw_params(layout, data, prefix, count_text=None):
@@ -1081,10 +1200,12 @@ def draw_params(layout, data, prefix, count_text=None):
         col.prop(data, prefix + "seg_90")
     else:
         col.prop(data, prefix + "even")
+        col.prop(data, prefix + "long_step")
         if prefix:
             # Only on the tab: the table the count is read from, with the row this rounding falls on
             _draw_table(col)
     col.prop(data, prefix + "keep_straight")
+    col.prop(data, prefix + "take_band")
     col.prop(data, prefix + "smooth")
     col.prop(data, prefix + "radius", text="Новый радиус (0 = как есть)")
 
@@ -1112,11 +1233,15 @@ def _draw_table(layout):
         row.label(text=str(sections_by_table(math.pi / 2.0, r, True)))
     note = box.column(align=True)
     note.scale_y = 0.8
-    note.label(text="Дальше +2 на круг за каждый метр")
+    note.label(text="Больше 5 м — длинная дуга: по шагу вдоль неё")
     for i, (turn, r, k) in enumerate(a[:3] for a in arcs):
         name = "Сейчас" if len(arcs) == 1 else f"Дуга {i + 1}"
-        note.label(text=f"{name}: R {r:.2f} м → {segments_per_circle(r):.0f} на круг, "
-                        f"{math.degrees(turn):.0f}° → {k}", icon='INFO' if i == 0 else 'BLANK1')
+        if r > CIRCLE_TABLE[-1][0]:
+            note.label(text=f"{name}: R {r:.2f} м — длинная дуга, {math.degrees(turn):.0f}°, "
+                            f"{turn * r:.1f} м по шагу → {k}", icon='INFO' if i == 0 else 'BLANK1')
+        else:
+            note.label(text=f"{name}: R {r:.2f} м → {segments_per_circle(r):.0f} на круг, "
+                            f"{math.degrees(turn):.0f}° → {k}", icon='INFO' if i == 0 else 'BLANK1')
     if last_measure.get("straights"):
         note.label(text=f"Прямых без сечений: {last_measure['straights']}", icon='BLANK1')
 
