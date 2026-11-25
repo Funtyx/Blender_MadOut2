@@ -734,6 +734,16 @@ class FilletSectionsCore(StripResampleCore):
             new_chains.append(chain)
             sections.append(sec)
 
+        # Where each new point sits on its old chain. While the outline stays put the nearest point
+        # of the old edge says it exactly. A new radius moves the edge, up to metres: the nearest
+        # point then is the wrong one - several new points caught on one old one, the texture
+        # squeezed to nothing and faces turned over (measured at 12 m: density 0, 8 of 64 flipped).
+        # So a moved ring is read by its share of length, which keeps the order along the kerb.
+        where = [None] * len(new_chains)
+        if reshaped:
+            for ci in range(1 if inner else 0, len(new_chains)):
+                where[ci] = _by_share(new_chains[ci], old_pts[ci])
+
         faces = []
         for i, s in enumerate(strips):
             A, sa = new_chains[i], sections[i]
@@ -752,7 +762,8 @@ class FilletSectionsCore(StripResampleCore):
                 f.smooth = s["smooth"]
                 faces.append(f)
                 if old_uv[i] is not None:
-                    _map_loops(f, old_uv[i], old_pts[i], old_pts[i + 1], s, a_side, b_side)
+                    _map_loops(f, old_uv[i], old_pts[i], old_pts[i + 1], s, a_side, b_side,
+                               where[i], where[i + 1])
                 else:
                     self._interpolate_loops(bm, f, s)
 
@@ -850,7 +861,26 @@ def _project(pts, acc, co, prefer=None):
     return k, f, acc[k] + f * (acc[k + 1] - acc[k])
 
 
-def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side):
+def _by_share(chain, old_pts):
+    """vertex -> (segment, fraction, station) on the old chain, at the same share of its length."""
+    new_acc = [0.0]
+    for a, b in zip(chain, chain[1:]):
+        new_acc.append(new_acc[-1] + (b.co - a.co).length)
+    old_acc = _along(old_pts)
+    total_new, total_old = new_acc[-1] or 1.0, old_acc[-1]
+    out = {}
+    k = 0
+    for v, d in zip(chain, new_acc):
+        st = d / total_new * total_old
+        while k < len(old_acc) - 2 and old_acc[k + 1] < st:
+            k += 1
+        span = old_acc[k + 1] - old_acc[k]
+        f = 0.0 if span <= 1e-12 else max(0.0, min(1.0, (st - old_acc[k]) / span))
+        out[v] = (k, f, st)
+    return out
+
+
+def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side, where_a=None, where_b=None):
     """
     UV and colours of a new face, read off the old faces of its strip by where each corner lies
     ALONG the strip, never by which old triangle is nearest in space.
@@ -873,8 +903,13 @@ def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side):
     olds = data["faces"]
     acc_b = _along(pts_b)
     acc_a = _along(pts_a)
-    mid = (b_side[0].co + b_side[-1].co) * 0.5
-    ref = _project(pts_b, acc_b, mid)[0]
+    if where_b is not None:
+        st = (where_b[b_side[0]][2] + where_b[b_side[-1]][2]) * 0.5
+        ref = max(k for k in range(len(acc_b) - 1) if acc_b[k] <= st + 1e-9) if st > 0 else 0
+        ref = min(ref, len(acc_b) - 2)
+    else:
+        mid = (b_side[0].co + b_side[-1].co) * 0.5
+        ref = _project(pts_b, acc_b, mid)[0]
 
     def joined(c0, c1, kind, li):
         # The unwrap runs on from old face c to c + 1 when both sides of the joint agree
@@ -887,9 +922,13 @@ def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side):
                     return False
         return True
 
-    def value(side, co, kind, li):
+    def value(side, vert, kind, li):
         pts, acc = (pts_a, acc_a) if side == "a" else (pts_b, acc_b)
-        c, f, st = _project(pts, acc, co, prefer=ref)
+        known = where_a if side == "a" else where_b
+        if known is not None and vert in known:
+            c, f, st = known[vert]
+        else:
+            c, f, st = _project(pts, acc, vert.co, prefer=ref)
         if c != ref and not joined(ref, c, kind, li):
             # carry on in the reference face's island, measured along the chain
             span = acc[ref + 1] - acc[ref]
@@ -904,9 +943,9 @@ def _map_loops(face, data, pts_a, pts_b, strip, a_side, b_side):
         if side is None:
             continue
         for li, lay in enumerate(strip["uv_layers"]):
-            l[lay].uv = value(side, l.vert.co, 0, li)
+            l[lay].uv = value(side, l.vert, 0, li)
         for li, lay in enumerate(strip["col_layers"]):
-            l[lay] = value(side, l.vert.co, 1, li)
+            l[lay] = value(side, l.vert, 1, li)
 
 
 def describe(summary):
