@@ -87,62 +87,94 @@ def arc_radius(pts, straight):
     return length / chord if chord > 1e-9 else 0.0
 
 
-def reshape(frames, radii, ref, new_radius):
-    """Every ring re-laid on an arc tangent to its own two lines, its radius changed by the same
-    amount as the reference ring's, so the rings stay concentric and the band keeps its width.
+def _layouts(frames, ref, radius):
+    """Every ring laid out round ONE centre: the reference ring's arc of this radius fixes it, and
+    each ring touches its own two lines at the foot of the perpendicular from it.
 
-    Returns (layouts, error, largest, short): a layout per ring - the straight up to the arc on each side
-    (possibly none) and the arc - or an error naming the radius that does fit. A bigger radius
-    pushes the tangent points away from the corner, and past the end of the selection there is
-    nothing to lay the arc on; the ends of the selection are the seams with the geometry beyond
-    and are never moved."""
-    theta = frames[ref]["theta"]
+    The obvious version - each ring its own arc, its radius changed by the same amount as the
+    reference ring's - put each ring's centre wherever its old, hand-drawn radius said, a few
+    centimetres apart, and the sections, which run between the rings' points, leant over (Dima:
+    "сечения наклоняются"). With one centre every ring's points are taken at the same angles from
+    it, so every section points at the centre."""
+    fr = frames[ref]
+    theta = fr["theta"]
     half = math.tan(abs(theta) / 2.0)
-    delta = new_radius - radii[ref]
-    largest = min(min(f["la"], f["lb"]) / half - r for f, r in zip(frames, radii)) + radii[ref]
-    smallest = radii[ref] - min(radii) + 0.05
-    # Two centimetres of slack at the tangent points: a rounding drawn by hand is a few millimetres
-    # off symmetric, and without it its own current radius did not fit (3.24 m asked, 3.22 allowed)
-    if new_radius > largest + REACH_SLACK / half:
-        # which end runs out: the caller can take in more of the straight there
-        short = set()
-        for f, r in zip(frames, radii):
-            t = (r + delta) * half
-            if t > f["la"] + REACH_SLACK:
-                short.add("a")
-            if t > f["lb"] + REACH_SLACK:
-                short.add("b")
-        return None, (f"Радиус {new_radius:.2f} м не помещается: больше {largest:.2f} м нельзя"), largest, short
-    if new_radius < smallest - 1e-4:
-        return None, f"Радиус меньше {smallest:.2f} м нельзя: внутреннее кольцо сойдётся в точку", largest, set()
-    layouts = []
-    for f, r in zip(frames, radii):
-        rr = r + delta
-        t = rr * half
-        a0 = f["corner"] - f["ta"] * t
-        b0 = f["corner"] + f["tb"] * t
-        side = 1.0 if theta > 0 else -1.0
-        normal = Vector((-f["ta"].y, f["ta"].x)) * side
-        layouts.append({
-            "pa": f["pa"], "pb": f["pb"], "a0": a0, "b0": b0,
-            "centre": a0 + normal * rr, "radius": rr, "theta": theta,
-            "straight_a": f["la"] - t, "straight_b": f["lb"] - t,
+    side = 1.0 if theta > 0 else -1.0
+    a0r = fr["corner"] - fr["ta"] * (radius * half)
+    centre = a0r + Vector((-fr["ta"].y, fr["ta"].x)) * side * radius
+    out = []
+    for f in frames:
+        a0 = f["pa"] + f["ta"] * (centre - f["pa"]).dot(f["ta"])
+        b0 = f["pb"] + f["tb"] * (centre - f["pb"]).dot(f["tb"])
+        out.append({
+            "pa": f["pa"], "pb": f["pb"], "a0": a0, "b0": b0, "centre": centre,
+            "ra": (a0 - centre).length, "rb": (b0 - centre).length, "theta": theta,
+            "straight_a": (a0 - f["pa"]).dot(f["ta"]), "straight_b": (f["pb"] - b0).dot(f["tb"]),
         })
-    return layouts, "", largest, set()
+    return out
+
+
+def _short(layouts):
+    """The ends where an arc would start past the end of the selection."""
+    short = set()
+    for lay in layouts:
+        if lay["straight_a"] < -REACH_SLACK:
+            short.add("a")
+        if lay["straight_b"] < -REACH_SLACK:
+            short.add("b")
+    return short
+
+
+def reshape(frames, radii, ref, new_radius):
+    """The rounding re-laid at new_radius on the reference ring, every ring round the same centre.
+
+    Returns (layouts, error, largest, short): a layout per ring - the straight up to the arc on each
+    side (possibly none) and the arc - or an error naming the radius that does fit, and which end
+    ran out. A bigger radius pushes the tangent points away from the corner, and past the end of
+    the selection there is nothing to lay the arc on; the ends of the selection are the seams with
+    the geometry beyond and are never moved."""
+    layouts = _layouts(frames, ref, new_radius)
+    short = _short(layouts)
+    if short:
+        # The largest radius that fits, found by halving: it is worked out by the same construction
+        # that lays the rings out, so the two cannot disagree
+        lo, hi = 0.0, new_radius
+        for _ in range(40):
+            mid = (lo + hi) / 2.0
+            if _short(_layouts(frames, ref, mid)):
+                hi = mid
+            else:
+                lo = mid
+        return None, f"Радиус {new_radius:.2f} м не помещается: больше {lo:.2f} м нельзя", lo, short
+    least = min(min(lay["ra"], lay["rb"]) for lay in layouts)
+    if least < 0.05:
+        # every ring is a fixed offset from the reference one, so this is the smallest that keeps
+        # the innermost ring a real arc
+        smallest = new_radius - least + 0.05
+        return None, f"Радиус меньше {smallest:.2f} м нельзя: внутреннее кольцо сойдётся в точку", 0.0, set()
+    return layouts, "", new_radius, set()
 
 
 def lay_out(layout, pieces):
-    """The plan points of one ring for the pieces ('a', 'arc', 'b') with the arc in k steps."""
+    """The plan points of one ring for the pieces ('a', 'arc', 'b') with the arc in k steps, taken
+    at equal angles from the common centre. A ring whose two lines are not quite the same distance
+    from it (a hand-drawn band, a mm or two) eases from one radius to the other along the arc."""
     out = [layout["pa"].copy()]
+    c = layout["centre"]
+    start = layout["a0"] - c
+    ang0 = math.atan2(start.y, start.x)
     for kind, k in pieces:
         if kind == "a":
             out.append(layout["a0"].copy())
         elif kind == "b":
             out.append(layout["pb"].copy())
         else:
-            start = layout["a0"] - layout["centre"]
             for j in range(1, k + 1):
-                out.append(layout["centre"] + _rot(start, layout["theta"] * j / k))
+                u = j / k
+                ang = ang0 + layout["theta"] * u
+                r = layout["ra"] + (layout["rb"] - layout["ra"]) * u
+                out.append(c + Vector((math.cos(ang), math.sin(ang))) * r)
+            out[-1] = layout["b0"].copy()
     if pieces[-1][0] == "arc":
         out[-1] = layout["pb"].copy()  # no straight after the arc: it ends on the selection's end
     if pieces[0][0] == "arc":
