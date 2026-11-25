@@ -7,7 +7,7 @@
       "id": "madout2_tools",
       "name": "MadOut2 Tools",
       "tagline": "\u0412\u0441\u0435 Blender-\u0438\u043d\u0441\u0442\u0440\u0443\u043c\u0435\u043d\u0442\u044b MadOut2 \u043d\u0430 \u043e\u0434\u043d\u043e\u0439 \u0432\u043a\u043b\u0430\u0434\u043a\u0435",
-      "version": "1.0.10",
+      "version": "1.0.11",
       "type": "add-on",
       "maintainer": "Funtyx",
       "license": [
@@ -17,9 +17,9 @@
       "permissions": {
         "files": "\u042d\u043a\u0441\u043f\u043e\u0440\u0442 FBX, PNG, \u043c\u0430\u0442\u0435\u0440\u0438\u0430\u043b\u043e\u0432 \u0438 \u043f\u0440\u0435\u0444\u0430\u0431\u043e\u0432 Unity"
       },
-      "archive_url": "./madout2_tools-1.0.10.zip",
-      "archive_size": 162003,
-      "archive_hash": "sha256:4ebf0b12377639e314220f22876c7e2516e74ed0cc21d5aea0a01921315acd44"
+      "archive_url": "./madout2_tools-1.0.11.zip",
+      "archive_size": 165437,
+      "archive_hash": "sha256:b68b0541439e04f1dada9f44192f895568b5cc6c9bb5a863391041982632998f"
     },
     {
       "schema_version": "1.0.0",
@@ -34,8 +34,8 @@
       ],
       "blender_version_min": "5.1.0",
       "archive_url": "./madout2_v2-1.6.6.zip",
-      "archive_size": 88113,
-      "archive_hash": "sha256:437e8a20a9c11d9f2012a2440ed972c8f42392b1b102df6e9a9faf8682140172"
+      "archive_size": 94123,
+      "archive_hash": "sha256:7c6ac0a6ab114d77c3481a6181871a47766afa4cb0b66572c3e2e2a34429941b"
     }
   ]
 }
