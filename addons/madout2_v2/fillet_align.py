@@ -8,8 +8,6 @@ import math
 
 from mathutils import Vector
 
-from .fillet_radius import fit_circle  # noqa: F401 - used here and re-exported
-
 # A ring whose ends are within this share of a step of the reference ring's keeps every inner
 # section radial and lets its end faces take the difference. Easing it in over EASE_ZONE of the arc
 # instead (the first version, for every ring) moved neighbouring rings by different amounts near
@@ -20,6 +18,30 @@ EXACT_ENDS = 1.0
 MIN_END = 0.4
 # Rings whose ends are further out than that ease them in over this much of the arc at each end
 EASE_ZONE = 0.3
+
+
+def fit_circle(points):
+    """Centre of the circle through points in the plan (least squares), or None if they are a line."""
+    n = len(points)
+    if n < 3:
+        return None
+    sx = sum(p.x for p in points) / n
+    sy = sum(p.y for p in points) / n
+    u = [p.x - sx for p in points]
+    v = [p.y - sy for p in points]
+    suu = sum(a * a for a in u)
+    svv = sum(b * b for b in v)
+    suv = sum(a * b for a, b in zip(u, v))
+    suuu = sum(a ** 3 for a in u)
+    svvv = sum(b ** 3 for b in v)
+    suvv = sum(a * b * b for a, b in zip(u, v))
+    svuu = sum(b * a * a for a, b in zip(u, v))
+    det = suu * svv - suv * suv
+    if abs(det) < 1e-12 * max(1.0, suu * svv):
+        return None
+    uc = (0.5 * (suuu + suvv) * svv - 0.5 * (svvv + svuu) * suv) / det
+    vc = (0.5 * (svvv + svuu) * suu - 0.5 * (suuu + suvv) * suv) / det
+    return Vector((uc + sx, vc + sy))
 
 
 def _angles(points, centre):
