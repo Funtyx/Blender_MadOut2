@@ -46,6 +46,59 @@ def _segment_turns(pts):
     return [a[j] + (c if j % 2 == 0 else -c) for j in range(n)]
 
 
+def fit_circle(points):
+    """Centre of the circle through points in the plan (least squares), or None if they are a line."""
+    n = len(points)
+    if n < 3:
+        return None
+    sx = sum(p.x for p in points) / n
+    sy = sum(p.y for p in points) / n
+    u = [p.x - sx for p in points]
+    v = [p.y - sy for p in points]
+    suu = sum(a * a for a in u)
+    svv = sum(b * b for b in v)
+    suv = sum(a * b for a, b in zip(u, v))
+    suuu = sum(a ** 3 for a in u)
+    svvv = sum(b ** 3 for b in v)
+    suvv = sum(a * b * b for a, b in zip(u, v))
+    svuu = sum(b * a * a for a, b in zip(u, v))
+    det = suu * svv - suv * suv
+    if abs(det) < 1e-12 * max(1.0, suu * svv):
+        return None
+    uc = (0.5 * (suuu + suvv) * svv - 0.5 * (svvv + svuu) * suv) / det
+    vc = (0.5 * (svvv + svuu) * suu - 0.5 * (suuu + suvv) * suv) / det
+    return Vector((uc + sx, vc + sy))
+
+
+def fit_arc(points):
+    """(turn, radius) of an arc from a circle fitted through ALL its points, or None.
+
+    Not from the turns of its segments: on a hand-placed arc whose joints turn 3 to 12 degrees a
+    segment's own turn is read with the noise amplified, and summed it gave 87 degrees for a
+    75-degree rounding and a radius of 2.99 m for one of 3.81 (Dima's corner). A fitted circle
+    averages the noise out instead."""
+    xy = [p.xy if hasattr(p, "xy") and len(p) > 2 else p for p in points]
+    if len(xy) < 3:
+        return None
+    c = fit_circle(xy)
+    if c is None:
+        return None
+    radius = sum((p - c).length for p in xy) / len(xy)
+    a0 = math.atan2(xy[0].y - c.y, xy[0].x - c.x)
+    total = 0.0
+    prev = a0
+    for p in xy[1:]:
+        a = math.atan2(p.y - c.y, p.x - c.x)
+        d = a - prev
+        while d > math.pi:
+            d -= 2.0 * math.pi
+        while d < -math.pi:
+            d += 2.0 * math.pi
+        total += d
+        prev = a
+    return abs(total), radius
+
+
 def frame(pts):
     """The two tangent lines of a ring and where they meet, in the plan.
 
@@ -76,15 +129,10 @@ def frame(pts):
 
 
 def arc_radius(pts, straight):
-    """Radius of a ring's arc from its own chords (2 R sin(s / 2) each), straights left out."""
-    s = _segment_turns(pts)
-    length = chord = 0.0
-    for j in range(len(pts) - 1):
-        if straight[j]:
-            continue
-        length += (pts[j + 1] - pts[j]).length
-        chord += 2.0 * math.sin(abs(s[j]) / 2.0)
-    return length / chord if chord > 1e-9 else 0.0
+    """Radius of a ring's arc, straights left out, from a circle fitted through its points."""
+    idx = sorted({i for j in range(len(pts) - 1) if not straight[j] for i in (j, j + 1)})
+    got = fit_arc([pts[i] for i in idx])
+    return got[1] if got else 0.0
 
 
 def _layouts(frames, ref, radius):

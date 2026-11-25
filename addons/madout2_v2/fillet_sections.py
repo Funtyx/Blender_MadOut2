@@ -208,6 +208,11 @@ def _measure(rings, mw):
     # ring is the worst choice: where a fan ends in a quad its last chord is bent (17.7 degrees
     # against 15 on Dima's corner) and a 90 degree rounding read as 91.
     longest = max(rings, key=lambda r: sum(((mw @ b.co) - (mw @ a.co)).length for a, b in zip(r, r[1:])))
+    fitted = [fillet_radius.fit_arc([mw @ v.co for v in r]) for r in rings]
+    if all(fitted):
+        # a circle through all the points: see fillet_radius.fit_arc for why not the chords
+        turn = fitted[rings.index(longest)][0]
+        return turn, max(f[1] for f in fitted)
     turn = _turn([mw @ v.co for v in longest])
     radius = 0.0
     for r in rings:
@@ -298,6 +303,17 @@ def _pieces(rings, mw, keep_straight):
     # The typical turn of the arc's joints: all joints that turn at all. Taking only the joints with
     # arc on both sides found none at all on a zigzag arc where every other segment read straight.
     turning = sorted(t for t in joints if t > math.radians(1.0))
+    lengths = [0.0] * n
+    for r in rings:
+        p = [mw @ v.co for v in r]
+        for i in range(n):
+            lengths[i] += (p[i + 1] - p[i]).length / len(rings)
+    arc_lengths = sorted(lengths[i] for i in range(n) if not straight[i]) or sorted(lengths)
+    arc_segment = arc_lengths[len(arc_lengths) // 2]
+
+    def run_length(j, k):
+        return sum(lengths[j:k + 1])
+
     if turning:
         typical = turning[len(turning) // 2]
         j = 0
@@ -310,7 +326,15 @@ def _pieces(rings, mw, keep_straight):
                 k += 1
             inside = joints[j:k]
             ends = ([joints[j - 1]] if j > 0 else []) + ([joints[k]] if k < n - 1 else [])
-            if any(t > 0.3 * typical for t in inside) or any(t > 0.75 * typical for t in ends):
+            tangent = not any(t > 0.3 * typical for t in inside) and not any(t > 0.75 * typical for t in ends)
+            # ...or a run much longer than the arc's own segments that does not bend: a hand-made
+            # rounding may start its first chord a little past the tangent point, so the joint there
+            # turns a full step (Dima's corner: 3.44 m and 1.53 m straights beside 0.57 m arc
+            # segments, end joints 8.3 and 8.5 against 8 typical). Read as arc, they made a 3.8 m
+            # rounding measure 5.9. Noise never does this - its false straights are as long as the
+            # segments around them.
+            long_run = run_length(j, k) >= 2.0 * arc_segment
+            if not (tangent or long_run):
                 for m in range(j, k + 1):
                     straight[m] = False
             j = k + 1
@@ -328,6 +352,15 @@ def _pieces(rings, mw, keep_straight):
 def _arc_of(rings, mw, first, last):
     """(turn, radius) of one arc piece: turn summed over its segments on the longest ring, radius
     the largest of the rings' - chords of angle s on a circle of radius R are 2 R sin(s / 2) long."""
+    fits = []
+    for r in rings:
+        p = [mw @ v.co for v in r]
+        fits.append((sum((b - a).length for a, b in zip(p[first:last + 2], p[first + 1:last + 2])),
+                     fillet_radius.fit_arc(p[first:last + 2])))
+    if all(f for _, f in fits):
+        # a circle through all the arc's points: see fillet_radius.fit_arc for why not the chords
+        turn = max(fits, key=lambda x: x[0])[1][0]
+        return turn, max(f[1] for _, f in fits)
     best = (0.0, 0.0, 0.0)
     radius = 0.0
     for r in rings:
@@ -632,6 +665,8 @@ class FilletSectionsCore(StripResampleCore):
 
     summary = (0, 0, False, 0, [], 0, 0)
     radius = 0.0  # the operator and the tab give their own; 0 keeps the rounding's radius
+    _tangents0 = None
+    _grown = set()
     long_step = 4.0
     take_band = False
 
@@ -762,6 +797,26 @@ class FilletSectionsCore(StripResampleCore):
         if any(f is None for f in frames):
             raise _Fail("Новый радиус — для одного скругления между двумя прямыми. У разворота или "
                         "почти прямой полосы угла нет: выделите каждую дугу отдельно")
+        # Taking in faces for a bigger radius must stay on the straights: once a taken face bends,
+        # the tangent lines turn with it. On Dima's corner a 6 m asking walked onto the next bend and
+        # read the corner as 58 degrees instead of 74.
+        # Checked at the ends that took faces only, against the tangent read before any were taken:
+        # a taken face of the straight runs along it, one of the next bend does not. (Comparing the
+        # whole corner angle instead failed on clean straights: an end that stops on the arc and one
+        # that stops on a straight read their tangents a little differently.)
+        # The ring may be read the other way round once faces are taken, so the ends are matched by
+        # where they are, and the lines compared without their direction.
+        p = world[0]
+        if self._tangents0 is None:
+            self._tangents0 = ((p[0].xy.copy(), frames[0]["ta"].copy()), (p[-1].xy.copy(), frames[0]["tb"].copy()))
+        else:
+            for end, near in ((p[0].xy, (p[1] - p[0]).xy), (p[-1].xy, (p[-1] - p[-2]).xy)):
+                origin, tangent = min(self._tangents0, key=lambda o: (o[0] - end).length)
+                if (origin - end).length < 0.01 or near.length < 1e-9:
+                    continue  # this end took nothing in
+                off = near.angle(tangent)
+                if min(off, math.pi - off) > math.radians(3.0):
+                    raise _Fail("Прямая за скруглением кончается: дальше поворот")
         n = len(rings[0]) - 1
         pieces = _pieces(rings, mw, True) or [(0, n - 1, False)]
         if sum(1 for pc in pieces if not pc[2]) > 1:
@@ -821,6 +876,8 @@ class FilletSectionsCore(StripResampleCore):
         mw = obj.matrix_world
         taken = 0
         last = None
+        self._tangents0 = None
+        self._grown = set()
         while True:
             inner, rings_full = find_rings(region)
             chains_full = ([inner] if inner else []) + rings_full
@@ -840,6 +897,7 @@ class FilletSectionsCore(StripResampleCore):
                 region = region | more
                 taken += 1
                 last = ex
+                self._grown |= set(ex.ends)
             except _Fail:
                 if last is None:
                     raise
