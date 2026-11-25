@@ -41,8 +41,9 @@ HELP = (
     "Новый радиус — скругление строится заново:",
     "  дуга касается тех же прямых, кольца идут",
     "  следом, концы выделения на месте. Больше",
-    "  радиус — точки касания дальше от угла; если",
-    "  не влезает, скажет максимум (выделите прямые).",
+    "  радиус — дуга начинается дальше по прямым:",
+    "  их грани берутся сами; если прямая кончается,",
+    "  скажет максимум.",
     "Плавность 0 — точки на старых рёбрах, контур",
     "  не двигается; 1 — на гладкой дуге.",
     "Концы скругления не сдвигаются. Откат — Ctrl+Z.",
@@ -475,6 +476,39 @@ def _inner_targets(inner, plan):
     return out
 
 
+# How many faces past each end of the selection a bigger radius may take in, one strip-width at a time
+MAX_TAKEN = 40
+
+
+class _TooBig(_Fail):
+    """A radius whose arc would start past the end of the selection, and at which end(s)."""
+
+    def __init__(self, message, ends, largest):
+        super().__init__(message)
+        self.ends = ends
+        self.largest = largest
+
+
+def _continuation(region, chains, ends):
+    """The faces just past the selection's ends that carry its strips on - one per strip, across
+    the end line - or None if any end that needs one has nothing there to take (the kerb turns
+    away, the mesh ends, a strip has no face beyond). Only the end that ran out grows: the far one
+    is left as it is, or its straight would be merged into one long face for no reason."""
+    out = set()
+    for end in ends:
+        idx = 0 if end == "a" else -1
+        for c0, c1 in zip(chains, chains[1:]):
+            a, b = c0[idx], c1[idx]
+            e = next((g for g in a.link_edges if g.other_vert(a) is b), None)
+            if e is None:
+                return None
+            beyond = [f for f in e.link_faces if f not in region]
+            if len(beyond) != 1 or len(beyond[0].verts) > 4:
+                return None
+            out.add(beyond[0])
+    return out or None
+
+
 class FilletSectionsCore(StripResampleCore):
     """The strip machinery of Strip Resample (welding to the neighbours, UV, colours), with a hub side."""
 
@@ -569,7 +603,9 @@ class FilletSectionsCore(StripResampleCore):
                 straight[j] = flat
         radii = [fillet_radius.arc_radius(p, straight) for p in world]
         ref = max(range(len(world)), key=lambda i: sum((b - a).length for a, b in zip(world[i], world[i][1:])))
-        layouts, err, _ = fillet_radius.reshape(frames, radii, ref, self.radius)
+        layouts, err, largest, short = fillet_radius.reshape(frames, radii, ref, self.radius)
+        if short:
+            raise _TooBig(err, short, largest)
         if err:
             raise _Fail(err)
         lay = layouts[ref]
@@ -610,14 +646,34 @@ class FilletSectionsCore(StripResampleCore):
         if not region:
             raise _Fail("Выделите грани скругления: веер от центра и кольца вокруг него")
 
-        inner, rings_full = find_rings(region)
-        chains_full = ([inner] if inner else []) + rings_full
-        extras = _extras(chains_full, 1 if inner else 0, region)
-        rings = [[v for v in r if v not in ex] for r, ex in zip(rings_full, extras)]
-        if inner and extras[0]:
-            raise _Fail("Лишняя точка на первом кольце веера: так пока не умею, уберите её или выделите без веера")
         mw = obj.matrix_world
-        reshaped = self._reshaped(rings, mw) if self.radius > 0.0 else None
+        taken = 0
+        last = None
+        while True:
+            inner, rings_full = find_rings(region)
+            chains_full = ([inner] if inner else []) + rings_full
+            extras = _extras(chains_full, 1 if inner else 0, region)
+            rings = [[v for v in r if v not in ex] for r, ex in zip(rings_full, extras)]
+            if inner and extras[0]:
+                raise _Fail("Лишняя точка на первом кольце веера: так пока не умею, уберите её или выделите без веера")
+            try:
+                reshaped = self._reshaped(rings, mw) if self.radius > 0.0 else None
+                break
+            except _TooBig as ex:
+                # A bigger radius starts the arc further back along the straights: take in the next
+                # face of every strip at the end that runs out, and try again
+                more = _continuation(region, chains_full, ex.ends)
+                if more is None or taken >= MAX_TAKEN:
+                    raise _Fail(f"{ex} — дальше за концом скругления нет прямой, на которую можно лечь")
+                region = region | more
+                taken += 1
+                last = ex
+            except _Fail:
+                if last is None:
+                    raise
+                # Taking in more ran into the next bend: the straight ends there
+                raise _Fail(f"Радиус {self.radius:.2f} м не помещается: больше {last.largest:.2f} м нельзя — "
+                            f"прямая за скруглением кончается, дальше следующий поворот")
         if reshaped:
             old, plan, found, ring_targets = reshaped
         else:
@@ -889,8 +945,8 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
         name="Радиус", default=0.0, min=0.0, soft_max=50.0, unit='LENGTH', precision=2,
         description="Новый радиус скругления (по внешнему кольцу, как в таблице); 0 — оставить как есть. "
                     "Дуга строится заново касательной к тем же прямым, кольца сдвигаются вместе, ширина "
-                    "бордюра не меняется, концы выделения стоят на месте. Если радиус не помещается, "
-                    "инструмент скажет, какой максимум")
+                    "бордюра не меняется. Больший радиус сам берёт грани прямых за концами выделения; "
+                    "если прямая кончается, инструмент скажет, какой максимум")
     keep_straight: BoolProperty(
         name="Прямые без сечений", default=True,
         description="Прямые участки между дугами (разворот, скругление с прямой вставкой) остаются одним "

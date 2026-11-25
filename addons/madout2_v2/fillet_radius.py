@@ -91,7 +91,7 @@ def reshape(frames, radii, ref, new_radius):
     """Every ring re-laid on an arc tangent to its own two lines, its radius changed by the same
     amount as the reference ring's, so the rings stay concentric and the band keeps its width.
 
-    Returns (layouts, error, largest): a layout per ring - the straight up to the arc on each side
+    Returns (layouts, error, largest, short): a layout per ring - the straight up to the arc on each side
     (possibly none) and the arc - or an error naming the radius that does fit. A bigger radius
     pushes the tangent points away from the corner, and past the end of the selection there is
     nothing to lay the arc on; the ends of the selection are the seams with the geometry beyond
@@ -104,10 +104,17 @@ def reshape(frames, radii, ref, new_radius):
     # Two centimetres of slack at the tangent points: a rounding drawn by hand is a few millimetres
     # off symmetric, and without it its own current radius did not fit (3.24 m asked, 3.22 allowed)
     if new_radius > largest + REACH_SLACK / half:
-        return None, (f"Радиус {new_radius:.2f} м не помещается в выделение: больше {largest:.2f} м нельзя. "
-                      f"Чтобы сделать больше, выделите вместе со скруглением и прямые за ним"), largest
+        # which end runs out: the caller can take in more of the straight there
+        short = set()
+        for f, r in zip(frames, radii):
+            t = (r + delta) * half
+            if t > f["la"] + REACH_SLACK:
+                short.add("a")
+            if t > f["lb"] + REACH_SLACK:
+                short.add("b")
+        return None, (f"Радиус {new_radius:.2f} м не помещается: больше {largest:.2f} м нельзя"), largest, short
     if new_radius < smallest - 1e-4:
-        return None, f"Радиус меньше {smallest:.2f} м нельзя: внутреннее кольцо сойдётся в точку", largest
+        return None, f"Радиус меньше {smallest:.2f} м нельзя: внутреннее кольцо сойдётся в точку", largest, set()
     layouts = []
     for f, r in zip(frames, radii):
         rr = r + delta
@@ -121,7 +128,7 @@ def reshape(frames, radii, ref, new_radius):
             "centre": a0 + normal * rr, "radius": rr, "theta": theta,
             "straight_a": f["la"] - t, "straight_b": f["lb"] - t,
         })
-    return layouts, "", largest
+    return layouts, "", largest, set()
 
 
 def lay_out(layout, pieces):
