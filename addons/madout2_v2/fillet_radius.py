@@ -102,14 +102,19 @@ def _layouts(frames, ref, radius):
     side = 1.0 if theta > 0 else -1.0
     a0r = fr["corner"] - fr["ta"] * (radius * half)
     centre = a0r + Vector((-fr["ta"].y, fr["ta"].x)) * side * radius
+    # Every ring's straight runs in the REFERENCE ring's direction, through its own end. Each ring's
+    # own tangent, read off its own end chord, is a few hundredths of a degree off the others - nothing
+    # over a metre, and over the 57 m of straight taken in for an 11 m radius on Dima's kerb it
+    # brought the kerb's two edges 15 cm together: 0.30 m wide at the end, 0.115 m at the arc.
+    ta, tb = fr["ta"], fr["tb"]
     out = []
     for f in frames:
-        a0 = f["pa"] + f["ta"] * (centre - f["pa"]).dot(f["ta"])
-        b0 = f["pb"] + f["tb"] * (centre - f["pb"]).dot(f["tb"])
+        a0 = f["pa"] + ta * (centre - f["pa"]).dot(ta)
+        b0 = f["pb"] + tb * (centre - f["pb"]).dot(tb)
         out.append({
             "pa": f["pa"], "pb": f["pb"], "a0": a0, "b0": b0, "centre": centre,
             "ra": (a0 - centre).length, "rb": (b0 - centre).length, "theta": theta,
-            "straight_a": (a0 - f["pa"]).dot(f["ta"]), "straight_b": (f["pb"] - b0).dot(f["tb"]),
+            "straight_a": (a0 - f["pa"]).dot(ta), "straight_b": (f["pb"] - b0).dot(tb),
         })
     return out
 
