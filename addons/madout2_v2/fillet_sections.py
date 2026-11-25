@@ -514,6 +514,25 @@ def _layer_beyond(region, chain):
     return out
 
 
+# A strip whose faces differ in width more than this is not running along the rounding
+MAX_WIDTH_SPREAD = 1.6
+
+
+def _layer_widths(chain, layer):
+    """How wide each face of a strip beside a chain is: its furthest point from the chain."""
+    on = set(chain)
+    widths = []
+    for f in layer:
+        base = [v for v in f.verts if v in on]
+        far = [v for v in f.verts if v not in on]
+        if not base or not far:
+            continue
+        if len(base) < 2:
+            continue  # a triangle touching the chain at one point says nothing about width
+        widths.append(max(min((v.co - b.co).length for b in base) for v in far))
+    return [w for w in widths if w > 1e-6]
+
+
 def grow_across(region, layers=12):
     """The selection grown across the strips that run alongside it - the footway beside a kerb, the
     kerb on its far side - for as long as each next one is a clean strip along the whole rounding.
@@ -531,6 +550,13 @@ def grow_across(region, layers=12):
         for chain in sides:
             layer = _layer_beyond(region, chain)
             if not layer:
+                continue
+            # Only a strip that runs ALONG the rounding - one width all the way, however wide (a 10 m
+            # plaza footway is one). The ground beyond is often one quad per edge too, but its faces
+            # are all different widths; taken in, it was laid round the new radius as a slab twenty
+            # metres across (Dima: "вот такая поломка была").
+            widths = _layer_widths(chain, layer)
+            if not widths or max(widths) > MAX_WIDTH_SPREAD * min(widths):
                 continue
             trial = region | layer
             try:
@@ -1317,6 +1343,12 @@ class MESH_OT_fillet_sections(FilletSectionsCore, bpy.types.Operator):
             return {'CANCELLED'}
         bmesh.update_edit_mesh(obj.data)
         self.report({'INFO'}, describe(self.summary) + f", {n_faces} граней")
+        if self.radius > 0.0:
+            # A new radius is for the rounding it was typed for. Left on the tab, it re-laid the next
+            # selection - a long gentle bend - as a 4.4 m corner (Dima: "что-то сломалось").
+            settings = getattr(context.scene, "madout2_v2", None)
+            if settings is not None and hasattr(settings, "fs_radius"):
+                settings.fs_radius = 0.0
         return {'FINISHED'}
 
 
