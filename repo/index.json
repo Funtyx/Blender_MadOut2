@@ -26,16 +26,16 @@
       "id": "madout2_v2",
       "name": "MadOut2 V2",
       "tagline": "\u0414\u043e\u0440\u043e\u0433\u0438, \u0440\u0435\u043b\u044c\u0435\u0444, \u043b\u0435\u0441\u0442\u043d\u0438\u0446\u044b \u0438 \u0434\u043b\u0438\u043d\u044b \u0440\u0451\u0431\u0435\u0440 \u0434\u043b\u044f MadOut2",
-      "version": "1.5.3",
+      "version": "1.5.4",
       "type": "add-on",
       "maintainer": "Funtyx",
       "license": [
         "SPDX:GPL-3.0-or-later"
       ],
       "blender_version_min": "5.1.0",
-      "archive_url": "./madout2_v2-1.5.3.zip",
-      "archive_size": 80204,
-      "archive_hash": "sha256:84bba10d9e2c0571006d6f22efbeb52b54a5a97c676a8df7e1c63c7c29e896fa"
+      "archive_url": "./madout2_v2-1.5.4.zip",
+      "archive_size": 80527,
+      "archive_hash": "sha256:7eb1681f0d355866336a48ce1079bc9d1dce4827451a6629f1d8fe49407397ba"
     }
   ]
 }
