@@ -738,12 +738,11 @@ class FilletSectionsCore(StripResampleCore):
         # of the old edge says it exactly. A new radius moves the edge, up to metres: the nearest
         # point then is the wrong one - several new points caught on one old one, the texture
         # squeezed to nothing and faces turned over (measured at 12 m: density 0, 8 of 64 flipped).
-        # So a moved strip is read along its middle line in metres, from each end (_strip_readings).
-        reads = [None] * len(strips)
+        # So a moved band is read along its middle line in metres, from each end (_band_readings).
+        band = None
         if reshaped:
-            for i in range(len(strips)):
-                reads[i] = _strip_readings(new_chains[i], sections[i], new_chains[i + 1], sections[i + 1],
-                                           old_pts[i], old_pts[i + 1], count)
+            first = 1 if inner else 0
+            band = _band_readings(new_chains[first:], sections[first:], old_pts[first:], count)
 
         faces = []
         for i, s in enumerate(strips):
@@ -764,7 +763,7 @@ class FilletSectionsCore(StripResampleCore):
                 faces.append(f)
                 if old_uv[i] is not None:
                     _map_loops(f, old_uv[i], old_pts[i], old_pts[i + 1], s, a_side, b_side,
-                               (reads[i][0], reads[i][1][k]) if reads[i] else None)
+                               (band[0], band[1][k]) if band else None)
                 else:
                     self._interpolate_loops(bm, f, s)
 
@@ -876,18 +875,20 @@ def _reading(acc, st):
     return k, (st - acc[k]) / (acc[k + 1] - acc[k]), st
 
 
-def _strip_readings(chain_a, sec_a, chain_b, sec_b, old_a, old_b, count):
-    """Where each new point of one strip reads its texture: (old middle-line stations, and per new
-    face a vertex -> (old face, fraction, station) map). Used when a new radius has moved the edge.
+def _band_readings(chains, sections, old_pts, count):
+    """Where each new ring point reads its texture after a new radius has moved the edge: (old
+    middle-line stations, and per new face a vertex -> (old face, fraction, station) map).
 
-    Two things the texture needs, each learned from a broken result:
+    Three things the texture needs, each learned from a broken result:
     - CONTINUE, never stretch (Dima: "не нужно растягивать её, а просто продолжить"): read in
       metres. Read by share of length, a ring that got longer stretched its texture 16 per cent.
-    - ONE reading for both edges of a face. Read in each edge's own metres, the outer edge of an arc
-      - longer than the inner one - ran ahead of it section by section and the stone joints leant
-      over ("тянут текстуру"). So a section is placed by the strip's MIDDLE line, the mean of its two
-      edges, and both corners of the section take that same old face and fraction - a joint across
-      the kerb stays across it.
+    - ONE reading per SECTION. Read in each ring's own metres, the outer edge of an arc - longer
+      than the inner one - ran ahead section by section and the stone joints leant over ("тянут
+      текстуру"): 13-19 cm of pattern across one face. A section is placed by the middle line of the
+      whole band (the mean of its rings) and every corner of the section takes the same old face and
+      fraction, so a joint across the kerb stays across it.
+    - for the WHOLE band, not per strip: a middle line per strip gave a ring shared by two strips two
+      readings, a seam along it in any texture laid over both (32 on a flat-projected fixture).
     The first half of the sections reads from the start, the second from the far end, so both ends
     meet their neighbours exactly; the one joint is at the middle section."""
     def acc(points):
@@ -896,10 +897,10 @@ def _strip_readings(chain_a, sec_a, chain_b, sec_b, old_a, old_b, count):
             out.append(out[-1] + (q - p).length)
         return out
 
-    old_mid = [(x + y) * 0.5 for x, y in zip(acc(old_a), acc(old_b))]
-    da = acc([v.co for v in chain_a])
-    db = acc([v.co for v in chain_b])
-    mid = [(da[sa] + db[sb]) * 0.5 for sa, sb in zip(sec_a, sec_b)]
+    old_accs = [acc(p) for p in old_pts]
+    old_mid = [sum(a[j] for a in old_accs) / len(old_accs) for j in range(len(old_accs[0]))]
+    new_accs = [acc([v.co for v in c]) for c in chains]
+    mid = [sum(d[sec[k]] for d, sec in zip(new_accs, sections)) / len(chains) for k in range(count + 1)]
     total_new, total_old = mid[-1], old_mid[-1]
 
     def at(t, half):
@@ -909,13 +910,12 @@ def _strip_readings(chain_a, sec_a, chain_b, sec_b, old_a, old_b, count):
     for k in range(count):
         half = 0 if k < count // 2 else 1
         out = {}
-        for chain, d, sec in ((chain_a, da, sec_a), (chain_b, db, sec_b)):
+        for chain, d, sec in zip(chains, new_accs, sections):
             i0, i1 = sec[k], sec[k + 1]
+            span = d[i1] - d[i0]
             for idx in range(i0, i1 + 1):
-                span = d[i1] - d[i0]
                 u = (d[idx] - d[i0]) / span if span > 1e-9 else (0.0 if idx == i0 else 1.0)
-                t = mid[k] + (mid[k + 1] - mid[k]) * u
-                out[chain[idx]] = at(t, half)
+                out[chain[idx]] = at(mid[k] + (mid[k + 1] - mid[k]) * u, half)
         faces.append(out)
     return old_mid, faces
 
