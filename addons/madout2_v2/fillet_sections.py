@@ -270,12 +270,50 @@ def _pieces(rings, mw, keep_straight):
         step = mags[(3 * len(mags)) // 4]
         if step < math.radians(1.0):
             continue
+        # Reading a segment's own turn from the joints amplifies noise - an error at one joint
+        # carries on, alternating, down the whole ring. On a hand-placed arc whose joints turn
+        # 3 to 12 degrees it gave segments of -31 and +14, and the straights it then "found" cut one
+        # 7 m rounding into five 2 m arcs of 2 sections each (Dima: "почему странно линии
+        # строятся"). A ring with any segment turning back by more than half a step is not read.
+        bend = 1.0 if sum(st) >= 0.0 else -1.0
+        if any(x * bend < -0.5 * step for x in st):
+            continue
         for j in range(n):
             shares[j] += abs(st[j]) / step
         used += 1
     if not used:
         return None
     straight = [shares[j] / used < STRAIGHT_SHARE for j in range(n)]
+    # Checked against the signature of a real straight between two arcs, read off the JOINTS
+    # (which noise does not get amplified in): inside it the joints do not turn, and at each end a
+    # joint turns about half an arc step - the chord leaves the arc at the tangent point (Dima's
+    # U-turn: 18, 18, 9, 9, 18). A run whose end joints turn like the arc's is a noisy arc.
+    joints = [0.0] * (n - 1)
+    for r in rings:
+        p = [mw @ v.co for v in r]
+        for i, (a, b, c) in enumerate(zip(p, p[1:], p[2:])):
+            d0, d1 = b - a, c - b
+            if d0.length > 1e-9 and d1.length > 1e-9:
+                joints[i] += d0.angle(d1) / len(rings)
+    # The typical turn of the arc's joints: all joints that turn at all. Taking only the joints with
+    # arc on both sides found none at all on a zigzag arc where every other segment read straight.
+    turning = sorted(t for t in joints if t > math.radians(1.0))
+    if turning:
+        typical = turning[len(turning) // 2]
+        j = 0
+        while j < n:
+            if not straight[j]:
+                j += 1
+                continue
+            k = j
+            while k + 1 < n and straight[k + 1]:
+                k += 1
+            inside = joints[j:k]
+            ends = ([joints[j - 1]] if j > 0 else []) + ([joints[k]] if k < n - 1 else [])
+            if any(t > 0.3 * typical for t in inside) or any(t > 0.75 * typical for t in ends):
+                for m in range(j, k + 1):
+                    straight[m] = False
+            j = k + 1
     if not any(straight) or all(straight):
         return None
     pieces = []
