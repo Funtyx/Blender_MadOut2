@@ -8,7 +8,15 @@ import math
 
 from mathutils import Vector
 
-# How much of the arc at each end eases the rings' own end angles in; the middle stays radial
+# A ring whose ends are within this share of a step of the reference ring's keeps every inner
+# section radial and lets its end faces take the difference. Easing it in over EASE_ZONE of the arc
+# instead (the first version, for every ring) moved neighbouring rings by different amounts near
+# the ends, and the sections between a kerb and the footway beside it turned (Dima: "некоторые
+# линии разворачиваются не ровно").
+EXACT_ENDS = 1.0
+# An end face is kept at least this share of a step wide
+MIN_END = 0.4
+# Rings whose ends are further out than that ease them in over this much of the arc at each end
 EASE_ZONE = 0.3
 
 
@@ -76,8 +84,8 @@ def align(denses, ref_targets, ref):
     Why not the equal share of each ring's own length, which is what a strip resample does: on
     Dima's sidewalk the inner kerb ends 2 degrees short of the outer one, and shares spread that
     over every section - 0 degrees off radial at one end, 7 at the other ("должно ровно
-    распределиться"). Here the middle is radial and each ring's own end angle is eased in over the
-    last EASE_ZONE of the arc at each end, the only place the mismatch exists."""
+    распределиться"). Here every inner section is radial and the end faces take each ring's
+    difference (see EXACT_ENDS)."""
     centre = fit_circle([p.xy for p in denses[ref]])
     if centre is None:
         return None
@@ -97,11 +105,28 @@ def align(denses, ref_targets, ref):
         ang = [a - shift for a in ang]
         d0 = ang[0] - ref_angles[0]
         d1 = ang[-1] - ref_angles[-1]
+        step = span / k
         pts = [dense[0].copy()]
-        for j in range(1, k):
-            u = (ref_angles[j] - ref_angles[0]) / span
-            delta = d0 * (1.0 - _ease(u / EASE_ZONE)) + d1 * _ease((u - (1.0 - EASE_ZONE)) / EASE_ZONE)
-            pts.append(_at_angle(dense, ang, ref_angles[j] + delta))
+        if abs(d0) < abs(step) * EXACT_ENDS and abs(d1) < abs(step) * EXACT_ENDS:
+            # Radial all the way: only the end faces take the difference between this ring's own
+            # ends and the reference ring's. An inner section too close to the ring's end is pulled
+            # back to keep the end face at least MIN_END of a step wide - a sliver otherwise.
+            sign = 1.0 if span > 0 else -1.0
+            lo = ang[0] + step * MIN_END
+            hi = ang[-1] - step * MIN_END
+            for j in range(1, k):
+                a = ref_angles[j]
+                if (a - lo) * sign < 0:
+                    a = lo
+                if (hi - a) * sign < 0:
+                    a = hi
+                pts.append(_at_angle(dense, ang, a))
+        else:
+            # Ends too far apart for one face to take the difference: ease it in near each end
+            for j in range(1, k):
+                u = (ref_angles[j] - ref_angles[0]) / span
+                delta = d0 * (1.0 - _ease(u / EASE_ZONE)) + d1 * _ease((u - (1.0 - EASE_ZONE)) / EASE_ZONE)
+                pts.append(_at_angle(dense, ang, ref_angles[j] + delta))
         pts.append(dense[-1].copy())
         # the eased angles must still run one way along the ring
         got = _angles([p.xy for p in pts], centre)

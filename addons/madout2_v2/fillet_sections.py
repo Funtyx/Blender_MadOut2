@@ -7,11 +7,13 @@
 # =====================================================
 
 import math
+from collections import Counter
 
 import bmesh
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
 from mathutils import Vector
+from mathutils.bvhtree import BVHTree
 
 from .strip_resample import (StripResampleCore, _Fail, _arc, _chains_from_region, _dense_curve,
                              _sample)
@@ -664,6 +666,50 @@ class FilletSectionsCore(StripResampleCore):
             last_measure.update(arcs=found, straights=len(pieces) - len(arcs))
         return old, plan, found
 
+    def _capture_strips(self, bm, chains):
+        """Strip Resample's capture, with one difference: a face belongs to a strip if it touches
+        both of its chains and no other chain - it may carry a point that is on NEITHER. Strip
+        Resample wants every point on the two chains, and the last face of Dima's footway, which
+        has one more point on the selection's end line, was left out: never deleted, the new faces
+        laid beside it, and a gap where the two met."""
+        region = getattr(self, "_region", None)
+        sets = [set(c) for c in chains]
+        on_any = set().union(*sets)
+        uv_layers = list(bm.loops.layers.uv.values())
+        col_layers = list(bm.loops.layers.color.values()) + list(bm.loops.layers.float_color.values())
+        pool = region if region is not None else bm.faces
+        strips = []
+        for i in range(len(chains) - 1):
+            pair = sets[i] | sets[i + 1]
+            faces = [f for f in pool
+                     if all(v in pair or v not in on_any for v in f.verts)
+                     and any(v in sets[i] for v in f.verts) and any(v in sets[i + 1] for v in f.verts)]
+            if not faces:
+                raise _Fail(f"Нет граней между линиями {i + 1} и {i + 2}: выделите соседние параллельные линии")
+            tri_co, tri_data = [], []
+            normal = Vector()
+            for f in faces:
+                normal += f.normal * f.calc_area()
+                loops = list(f.loops)
+                for j in range(1, len(loops) - 1):
+                    tri = (loops[0], loops[j], loops[j + 1])
+                    tri_co.append(tuple(l.vert.co.copy() for l in tri))
+                    tri_data.append(tuple(
+                        ([l[lay].uv.copy() for lay in uv_layers], [Vector(l[lay]) for lay in col_layers])
+                        for l in tri))
+            verts = [c for t in tri_co for c in t]
+            polys = [(3 * k, 3 * k + 1, 3 * k + 2) for k in range(len(tri_co))]
+            strips.append({
+                "faces": faces,
+                "material": Counter(f.material_index for f in faces).most_common(1)[0][0],
+                "smooth": Counter(f.smooth for f in faces).most_common(1)[0][0],
+                "normal": normal.normalized() if normal.length > 0 else normal,
+                "tri_co": tri_co, "tri_data": tri_data,
+                "bvh": BVHTree.FromPolygons(verts, polys),
+                "uv_layers": uv_layers, "col_layers": col_layers,
+            })
+        return strips
+
     def _table_count(self, turn, radius):
         if radius > CIRCLE_TABLE[-1][0]:
             return sections_long(turn, turn * radius, self.long_step, self.even)
@@ -786,9 +832,11 @@ class FilletSectionsCore(StripResampleCore):
         else:
             new_inner = _inner_targets(inner, plan)
         chains = ([inner] if inner else []) + rings
+        self._region = region
         strips = self._capture_strips(bm, chains_full)
         old_uv = _capture_faces(chains, strips)
         old_pts = ([[v.co.copy() for v in inner]] if inner else []) + pts
+        end_points = _end_lines(chains_full, strips)
         all_band = {f for s in strips for f in s["faces"]}
         chain_edge_set = {bm.edges.get((a, b)) for r in chains_full for a, b in zip(r, r[1:]) if a is not b}
         band_edges = {e for f in all_band for e in f.edges} - chain_edge_set
@@ -857,7 +905,11 @@ class FilletSectionsCore(StripResampleCore):
             for k in range(count):
                 a_side = A[sa[k]:sa[k + 1] + 1]
                 b_side = B[sb[k]:sb[k + 1] + 1]
-                poly = list(dict.fromkeys(a_side + b_side[::-1]))
+                start_line, end_line = end_points[i]
+                # the points on the selection's two end lines go into the end faces, in order
+                tail = [v for v, _ in reversed(start_line)] if k == 0 else []
+                mid = [v for v, _ in end_line] if k == count - 1 else []
+                poly = list(dict.fromkeys(a_side + mid + b_side[::-1] + tail))
                 if len(poly) < 3 or bm.faces.get(poly):
                     continue
                 f = bm.faces.new(poly)
@@ -872,6 +924,14 @@ class FilletSectionsCore(StripResampleCore):
                                (band[0], band[1][k]) if band else None)
                 else:
                     self._interpolate_loops(bm, f, s)
+                fixed = dict(start_line + end_line)
+                for l in f.loops:
+                    if l.vert in fixed:
+                        uvs, cols = fixed[l.vert]
+                        for li, lay in enumerate(s["uv_layers"]):
+                            l[lay].uv = uvs[li]
+                        for li, lay in enumerate(s["col_layers"]):
+                            l[lay] = cols[li]
 
         for v in bm.verts:
             v.select = False
@@ -886,6 +946,41 @@ class FilletSectionsCore(StripResampleCore):
         self.summary = (old, count, inner is not None, len(rings), found, sum(1 for pc in plan if pc[2]),
                         self.taken)
         return faces
+
+
+def _end_lines(chains, strips):
+    """Per strip, the points on the selection's two end lines between its two chains - ones that lie
+    on neither, with their old UV and colours - as (start line, end line), each ordered from the
+    inner chain to the outer.
+
+    The trap: Dima's footway ends in a step, and between the ends of two rings its end line carries
+    one more point, welded to the straight beyond. The new end face joined the two ring ends
+    directly, past that point, and left a triangle of daylight between it and the straight ("видишь,
+    последняя линия не соединилась")."""
+    out = []
+    for i, s in enumerate(strips):
+        A, B = chains[i], chains[i + 1]
+        on_chains = set(A) | set(B)
+        lines = []
+        for a, b in ((A[0], B[0]), (A[-1], B[-1])):
+            found = []
+            face = next((f for f in s["faces"] if a in f.verts and b in f.verts), None)
+            if face is not None and a is not b:
+                loop = list(face.loops)
+                verts = [l.vert for l in loop]
+                ia, ib = verts.index(a), verts.index(b)
+                n = len(verts)
+                fwd = [verts[(ia + d) % n] for d in range(1, (ib - ia) % n)]
+                back = [verts[(ia - d) % n] for d in range(1, (ia - ib) % n)]
+                path = fwd if not any(v in on_chains for v in fwd) else (
+                    back if not any(v in on_chains for v in back) else [])
+                for v in path:
+                    l = loop[verts.index(v)]
+                    found.append((v, ([l[lay].uv.copy() for lay in s["uv_layers"]],
+                                      [Vector(l[lay]) for lay in s["col_layers"]])))
+            lines.append(found)
+        out.append(tuple(lines))
+    return out
 
 
 def _capture_faces(chains, strips):
